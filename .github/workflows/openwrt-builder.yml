@@ -83,37 +83,12 @@ jobs:
           build-${{ runner.os }}-
     # ========== 缓存步骤结束 ==========
 
-	- name: Clone source code
-	  working-directory: /workdir
-	  run: |
-	    df -hT $PWD
-	    
-	    # 清理可能存在的无效目录
-	    if [ -e "openwrt" ] && [ ! -d "openwrt/.git" ]; then
-	      echo "Removing non-git directory..."
-	      sudo rm -rf openwrt
-	    fi
-	    
-	    # 克隆或更新代码
-	    if [ -d "openwrt/.git" ]; then
-	      echo "Repository exists, updating..."
-	      cd openwrt
-	      git checkout $REPO_BRANCH
-	      git pull --depth=1 origin $REPO_BRANCH
-	      cd ..
-	    else
-	      echo "Cloning repository..."
-	      git clone --depth=1 $REPO_URL -b $REPO_BRANCH openwrt
-	    fi
-	    
-	    # 创建软链接
-	    ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
-	    
-	    # 显示当前状态
-	    cd openwrt
-	    git log -1 --oneline
-
-
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
     - name: Load custom feeds
       run: |
