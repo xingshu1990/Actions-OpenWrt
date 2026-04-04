@@ -50,6 +50,39 @@ jobs:
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
 
+    # ========== 缓存步骤 ==========
+    - name: Cache ccache
+      uses: actions/cache@v3
+      with:
+        path: /workdir/openwrt/.ccache
+        key: ccache-${{ runner.os }}-${{ hashFiles('openwrt/.config') }}-${{ github.ref }}
+        restore-keys: |
+          ccache-${{ runner.os }}-${{ hashFiles('openwrt/.config') }}-
+          ccache-${{ runner.os }}-
+
+    - name: Cache DL directory
+      id: cache-dl
+      uses: actions/cache@v3
+      with:
+        path: /workdir/openwrt/dl
+        key: dl-${{ runner.os }}-${{ hashFiles('openwrt/feeds.conf.default', 'openwrt/.config') }}-${{ github.ref }}
+        restore-keys: |
+          dl-${{ runner.os }}-${{ hashFiles('openwrt/feeds.conf.default', 'openwrt/.config') }}-
+          dl-${{ runner.os }}-
+
+    - name: Cache build directory
+      uses: actions/cache@v3
+      with:
+        path: |
+          /workdir/openwrt/build_dir
+          /workdir/openwrt/staging_dir
+          /workdir/openwrt/tmp
+        key: build-${{ runner.os }}-${{ hashFiles('openwrt/.config') }}-${{ github.sha }}
+        restore-keys: |
+          build-${{ runner.os }}-${{ hashFiles('openwrt/.config') }}-
+          build-${{ runner.os }}-
+    # ========== 缓存步骤结束 ==========
+
     - name: Clone source code
       working-directory: /workdir
       run: |
@@ -83,20 +116,49 @@ jobs:
       run: |
         cd openwrt
         make defconfig
-        make download -j8
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
+        # 如果 DL 缓存命中，跳过下载
+        if [ "${{ steps.cache-dl.outputs.cache-hit }}" != "true" ]; then
+          echo "DL cache not found, downloading sources..."
+          make download -j8
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
+        else
+          echo "DL cache hit, verifying downloads..."
+          # 仍然检查并补全缺失的源码
+          make download -j4
+          find dl -size -1024c -exec rm -f {} \;
+        fi
 
     - name: Compile the firmware
       id: compile
       run: |
         cd openwrt
         echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
-        echo "status=success" >> $GITHUB_OUTPUT
+        
+        # 启用 ccache
+        export PATH="/usr/lib/ccache:$PATH"
+        export CCACHE_DIR=/workdir/openwrt/.ccache
+        ccache -s  # 显示缓存统计
+        
+        # 直接编译完整固件（不要单独编译 toolchain，会重复）
+        # 使用 V=s 可以看到详细输出，便于调试
+        make -j$(nproc) V=s || make -j1 V=s
+        
+        # 检查编译是否成功
+        if [ $? -eq 0 ]; then
+          echo "status=success" >> $GITHUB_OUTPUT
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+        
+        # 提取设备名称
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
         [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+        
+        # 显示 ccache 统计
+        ccache -s
 
     - name: Check space usage
       if: (!cancelled())
