@@ -169,9 +169,18 @@ jobs:
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: |
-        cd openwrt/bin/targets/*/*
+        cd openwrt/bin/targets/*/* || exit 1
+        
         rm -rf packages
+        
+        # 防止异常路径
+        if [ "$PWD" = "/" ] || [ -z "$PWD" ]; then
+          echo "Invalid firmware path!"
+          exit 1
+        fi
+    
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "Firmware path: $PWD"
         echo "status=success" >> $GITHUB_OUTPUT
 
     - name: Upload firmware directory
@@ -198,7 +207,10 @@ jobs:
       with:
         tag_name: ${{ steps.tag.outputs.release_tag }}
         body_path: release.txt
-        files: ${{ env.FIRMWARE }}/*
+        files: |
+          ${{ env.FIRMWARE }}/*.bin
+          ${{ env.FIRMWARE }}/*.img
+          ${{ env.FIRMWARE }}/*.gz
 
     - name: Delete workflow runs
       uses: Mattraks/delete-workflow-runs@main
