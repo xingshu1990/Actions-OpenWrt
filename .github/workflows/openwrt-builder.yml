@@ -51,36 +51,48 @@ jobs:
         sudo chown $USER:$GROUPS /workdir
 
     # ========== 缓存步骤 ==========
-    - name: Cache
-      uses: stupidloud/cachewrtbuild@main
+    - name: Cache ccache
+      uses: actions/cache@v3
       with:
-        ccache: 'true'
-        mixkey: ${{ matrix.target }}
-        clean: ${{ contains(github.event.action, 'nocache') }}
-        prefix: ${{ github.workspace }}/openwrt
+        path: /workdir/openwrt/.ccache
+        key: ccache-${{ runner.os }}-${{ hashFiles('openwrt/.config') }}-${{ github.ref }}
+        restore-keys: |
+          ccache-${{ runner.os }}-${{ hashFiles('openwrt/.config') }}-
+          ccache-${{ runner.os }}-
+
+    - name: Cache DL directory
+      id: cache-dl
+      uses: actions/cache@v3
+      with:
+        path: /workdir/openwrt/dl
+        key: dl-${{ runner.os }}-${{ hashFiles('openwrt/feeds.conf.default', 'openwrt/.config') }}-${{ github.ref }}
+        restore-keys: |
+          dl-${{ runner.os }}-${{ hashFiles('openwrt/feeds.conf.default', 'openwrt/.config') }}-
+          dl-${{ runner.os }}-
+
+    - name: Cache build directory
+      uses: actions/cache@v3
+      with:
+        path: |
+          /workdir/openwrt/build_dir
+          /workdir/openwrt/staging_dir
+          /workdir/openwrt/tmp
+        key: build-${{ runner.os }}-${{ hashFiles('openwrt/.config') }}-${{ github.sha }}
+        restore-keys: |
+          build-${{ runner.os }}-${{ hashFiles('openwrt/.config') }}-
+          build-${{ runner.os }}-
     # ========== 缓存步骤结束 ==========
 
     - name: Clone source code
       working-directory: /workdir
       run: |
         df -hT $PWD
-        
-        # 智能处理：只在不使用缓存或强制刷新时才删除
-        if [ "${{ steps.cache.outputs.cache-hit }}" != "true" ] || [ "${{ github.event.inputs.clean_cache }}" == "true" ]; then
-          echo "Cache miss or forced clean, cloning fresh source..."
+        # 如果目录已存在，先清理
+        if [ -d "openwrt" ]; then
+          echo "Directory openwrt already exists, removing..."
           sudo rm -rf openwrt
-          git clone $REPO_URL -b $REPO_BRANCH openwrt
-        else
-          echo "Cache hit, reusing existing source..."
-          if [ -d "openwrt" ]; then
-            cd openwrt
-            git pull  # 更新到最新
-            cd ..
-          else
-            git clone $REPO_URL -b $REPO_BRANCH openwrt
-          fi
         fi
-        
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
         ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
 
