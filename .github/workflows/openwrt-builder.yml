@@ -65,14 +65,22 @@ jobs:
       working-directory: /workdir
       run: |
         df -hT $PWD
-        # 如果目录已存在，先清理
-        if [ -d "openwrt" ]; then
-          echo "Directory openwrt already exists, removing..."
+        
+        # 智能处理：只在不使用缓存或强制刷新时才删除
+        if [ "${{ steps.cache.outputs.cache-hit }}" != "true" ] || [ "${{ github.event.inputs.clean_cache }}" == "true" ]; then
+          echo "Cache miss or forced clean, cloning fresh source..."
           sudo rm -rf openwrt
+          git clone $REPO_URL -b $REPO_BRANCH openwrt
+        else
+          echo "Cache hit, reusing existing source..."
+          if [ -d "openwrt/.git" ]; then
+            cd openwrt
+            git pull
+            cd ..
+          else
+            git clone $REPO_URL -b $REPO_BRANCH openwrt
+          fi
         fi
-        git clone $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
-
 
 
 
