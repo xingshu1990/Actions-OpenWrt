@@ -51,36 +51,14 @@ jobs:
         sudo chown $USER:$GROUPS /workdir
 
     # ========== 缓存步骤 ==========
-    - name: Cache ccache
-      uses: actions/cache@v3
+    - name: Cache
+      id: cache
+      uses: stupidloud/cachewrtbuild@main
       with:
-        path: /workdir/openwrt/.ccache
-        key: ccache-${{ runner.os }}-${{ hashFiles('openwrt/.config') }}-${{ github.ref }}
-        restore-keys: |
-          ccache-${{ runner.os }}-${{ hashFiles('openwrt/.config') }}-
-          ccache-${{ runner.os }}-
-
-    - name: Cache DL directory
-      id: cache-dl
-      uses: actions/cache@v3
-      with:
-        path: /workdir/openwrt/dl
-        key: dl-${{ runner.os }}-${{ hashFiles('openwrt/feeds.conf.default', 'openwrt/.config') }}-${{ github.ref }}
-        restore-keys: |
-          dl-${{ runner.os }}-${{ hashFiles('openwrt/feeds.conf.default', 'openwrt/.config') }}-
-          dl-${{ runner.os }}-
-
-    - name: Cache build directory
-      uses: actions/cache@v3
-      with:
-        path: |
-          /workdir/openwrt/build_dir
-          /workdir/openwrt/staging_dir
-          /workdir/openwrt/tmp
-        key: build-${{ runner.os }}-${{ hashFiles('openwrt/.config') }}-${{ github.sha }}
-        restore-keys: |
-          build-${{ runner.os }}-${{ hashFiles('openwrt/.config') }}-
-          build-${{ runner.os }}-
+        ccache: 'true'
+        mixkey: 'openwrt'
+        clean: ${{ github.event.inputs.clean_cache == 'true' }}
+        prefix: ${{ github.workspace }}/openwrt
     # ========== 缓存步骤结束 ==========
 
     - name: Clone source code
