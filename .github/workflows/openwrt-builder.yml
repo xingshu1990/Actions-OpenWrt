@@ -28,53 +28,74 @@ jobs:
 
         sudo timedatectl set-timezone "$TZ"
 
-    # ✅ 先 clone
     - name: Clone source
       run: |
         git clone $REPO_URL -b $REPO_BRANCH openwrt
 
-    # ✅ 再放配置（必须在 cache 前）
     - name: Load config
       run: |
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        if [ -e $CONFIG_FILE ]; then
+          cp $CONFIG_FILE openwrt/.config
+        else
+          echo "No .config found!"
+          exit 1
+        fi
 
-    # ✅ 生成稳定 cache key（关键优化）
+    # ✅ 增强版 cache key（包含 feeds 和关键脚本）
     - name: Generate cache key
       id: cache_key
       run: |
         cd openwrt
-        make defconfig
+        
+        # 必须检查 defconfig 是否成功
+        if ! make defconfig; then
+          echo "❌ make defconfig failed!"
+          exit 1
+        fi
+        
+        # config hash
         grep -v "^#" .config | sort > config.seed
-        echo "key=$(md5sum config.seed | cut -d ' ' -f1)" >> $GITHUB_OUTPUT
+        CONFIG_HASH=$(md5sum config.seed | cut -d ' ' -f1)
+        
+        # feeds hash（防止 feeds 更新但 config 没变）
+        FEEDS_HASH=$(md5sum feeds.conf.default 2>/dev/null | cut -d ' ' -f1 || echo "no-feeds")
+        
+        # diy 脚本 hash（防止修改脚本但没改 config）
+        DIY1_HASH=$(md5sum $GITHUB_WORKSPACE/$DIY_P1_SH 2>/dev/null | cut -d ' ' -f1 || echo "no-diy1")
+        DIY2_HASH=$(md5sum $GITHUB_WORKSPACE/$DIY_P2_SH 2>/dev/null | cut -d ' ' -f1 || echo "no-diy2")
+        
+        FINAL_KEY="${CONFIG_HASH}-${FEEDS_HASH}-${DIY1_HASH:0:8}-${DIY2_HASH:0:8}"
+        
+        echo "CACHE_KEY=$FINAL_KEY" >> $GITHUB_ENV
+        echo "✅ Using cache key: $FINAL_KEY"
 
-    # ✅ 缓存 dl（下载包）
+    # ✅ dl 缓存（源码包）
     - name: Cache dl
       uses: actions/cache@v4
       with:
         path: openwrt/dl
-        key: ${{ runner.os }}-dl-${{ steps.cache_key.outputs.key }}
+        key: ${{ runner.os }}-dl-${{ env.CACHE_KEY }}
         restore-keys: |
           ${{ runner.os }}-dl-
+          ${{ runner.os }}-dl-
 
-    # ✅ 缓存工具链（最大加速点）
+    # ✅ 只缓存 staging_dir（稳定关键）
     - name: Cache toolchain
       uses: actions/cache@v4
       with:
-        path: |
-          openwrt/staging_dir
-          openwrt/build_dir
-        key: ${{ runner.os }}-toolchain-${{ steps.cache_key.outputs.key }}
+        path: openwrt/staging_dir
+        key: ${{ runner.os }}-staging-${{ env.CACHE_KEY }}
         restore-keys: |
-          ${{ runner.os }}-toolchain-
+          ${{ runner.os }}-staging-
 
-    # ✅ ccache（正确写法）
+    # ✅ ccache（全局共享）
     - name: Cache ccache
       uses: actions/cache@v4
       with:
         path: ~/.ccache
-        key: ${{ runner.os }}-ccache
+        key: ${{ runner.os }}-ccache-v1
         restore-keys: |
-          ${{ runner.os }}-ccache
+          ${{ runner.os }}-ccache-
 
     - name: Load feeds
       run: |
@@ -94,12 +115,14 @@ jobs:
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
 
-    # ✅ 启用 ccache
     - name: Enable ccache
       run: |
         echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
         echo "CCACHE_DIR=~/.ccache" >> $GITHUB_ENV
-        echo "CCACHE_MAXSIZE=500M" >> $GITHUB_ENV
+        echo "CCACHE_MAXSIZE=1G" >> $GITHUB_ENV
+        echo "CCACHE_COMPRESS=1" >> $GITHUB_ENV
+        echo "CCACHE_SLOPPINESS=time_macros" >> $GITHUB_ENV
+        ccache -s
 
     - name: Download packages
       run: |
@@ -111,29 +134,49 @@ jobs:
       id: compile
       run: |
         cd openwrt
-
-        make -j$(nproc) || make -j1 V=s
-
-        if ls bin/targets/*/* 1>/dev/null 2>&1; then
-          echo "status=success" >> $GITHUB_OUTPUT
+        
+        echo "=== CCache Stats ==="
+        ccache -s
+        
+        echo "=== Starting Build ==="
+        # 保存编译日志用于调试
+        if make -j$(nproc) 2>&1 | tee build.log; then
+          echo "✅ Build successful"
         else
-          echo "No firmware built!"
+          echo "❌ Parallel build failed, trying single core..."
+          make -j1 V=s
+        fi
+        
+        # 验证固件
+        if ls bin/targets/*/*.{bin,img} 2>/dev/null | grep -q .; then
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+          echo "✅ Firmware found:"
+          ls -lh bin/targets/*/*.{bin,img} 2>/dev/null | head -5
+        else
+          echo "❌ No firmware built!"
+          echo "Last 50 lines of build log:"
+          tail -50 build.log
           exit 1
         fi
-
-        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
 
     - name: Organize firmware
       id: organize
       if: steps.compile.outputs.status == 'success'
       run: |
         TARGET_DIR=$(find openwrt/bin/targets/ -type d -mindepth 2 -maxdepth 2 | head -n 1)
-
-        cd $TARGET_DIR
+        
+        if [ -z "$TARGET_DIR" ]; then
+          echo "❌ No firmware directory!"
+          exit 1
+        fi
+        
+        cd "$TARGET_DIR"
         rm -rf packages
-
+        
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
+        echo "✅ Firmware directory: $PWD"
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
@@ -144,3 +187,4 @@ jobs:
           ${{ env.FIRMWARE }}/*.bin
           ${{ env.FIRMWARE }}/*.img
           ${{ env.FIRMWARE }}/*.gz
+        retention-days: 7
