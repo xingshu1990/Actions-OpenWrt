@@ -24,13 +24,57 @@ jobs:
         sudo apt-get update -qq
         sudo apt-get install -y build-essential clang flex bison g++ gawk \
         gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
-        python3 python3-pyelftools rsync unzip zlib1g-dev file wget
+        python3 python3-pyelftools rsync unzip zlib1g-dev file wget ccache
 
         sudo timedatectl set-timezone "$TZ"
 
+    # ✅ 先 clone
     - name: Clone source
       run: |
         git clone $REPO_URL -b $REPO_BRANCH openwrt
+
+    # ✅ 再放配置（必须在 cache 前）
+    - name: Load config
+      run: |
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+
+    # ✅ 生成稳定 cache key（关键优化）
+    - name: Generate cache key
+      id: cache_key
+      run: |
+        cd openwrt
+        make defconfig
+        grep -v "^#" .config | sort > config.seed
+        echo "key=$(md5sum config.seed | cut -d ' ' -f1)" >> $GITHUB_OUTPUT
+
+    # ✅ 缓存 dl（下载包）
+    - name: Cache dl
+      uses: actions/cache@v4
+      with:
+        path: openwrt/dl
+        key: ${{ runner.os }}-dl-${{ steps.cache_key.outputs.key }}
+        restore-keys: |
+          ${{ runner.os }}-dl-
+
+    # ✅ 缓存工具链（最大加速点）
+    - name: Cache toolchain
+      uses: actions/cache@v4
+      with:
+        path: |
+          openwrt/staging_dir
+          openwrt/build_dir
+        key: ${{ runner.os }}-toolchain-${{ steps.cache_key.outputs.key }}
+        restore-keys: |
+          ${{ runner.os }}-toolchain-
+
+    # ✅ ccache（正确写法）
+    - name: Cache ccache
+      uses: actions/cache@v4
+      with:
+        path: ~/.ccache
+        key: ${{ runner.os }}-ccache
+        restore-keys: |
+          ${{ runner.os }}-ccache
 
     - name: Load feeds
       run: |
@@ -44,18 +88,23 @@ jobs:
     - name: Install feeds
       run: cd openwrt && ./scripts/feeds install -a
 
-    - name: Load config
+    - name: Load DIY config
       run: |
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
         chmod +x $DIY_P2_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
 
+    # ✅ 启用 ccache
+    - name: Enable ccache
+      run: |
+        echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
+        echo "CCACHE_DIR=~/.ccache" >> $GITHUB_ENV
+        echo "CCACHE_MAXSIZE=500M" >> $GITHUB_ENV
+
     - name: Download packages
       run: |
         cd openwrt
-        make defconfig
-        make download -j8
+        make download -j16
         find dl -size -1024c -delete
 
     - name: Compile
@@ -63,9 +112,8 @@ jobs:
       run: |
         cd openwrt
 
-        make -j$(nproc) || make -j1
+        make -j$(nproc) || make -j1 V=s
 
-        # ✅ 强制检查固件目录（关键）
         if ls bin/targets/*/* 1>/dev/null 2>&1; then
           echo "status=success" >> $GITHUB_OUTPUT
         else
@@ -75,22 +123,11 @@ jobs:
 
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
 
-    - name: Debug firmware
-      if: steps.compile.outputs.status == 'success'
-      run: |
-        echo "==== Firmware files ===="
-        ls -R openwrt/bin/targets
-
     - name: Organize firmware
       id: organize
       if: steps.compile.outputs.status == 'success'
       run: |
         TARGET_DIR=$(find openwrt/bin/targets/ -type d -mindepth 2 -maxdepth 2 | head -n 1)
-
-        if [ -z "$TARGET_DIR" ]; then
-          echo "No firmware dir!"
-          exit 1
-        fi
 
         cd $TARGET_DIR
         rm -rf packages
@@ -107,15 +144,3 @@ jobs:
           ${{ env.FIRMWARE }}/*.bin
           ${{ env.FIRMWARE }}/*.img
           ${{ env.FIRMWARE }}/*.gz
-
-    - name: Release
-      uses: softprops/action-gh-release@v2
-      if: steps.organize.outputs.status == 'success'
-      with:
-        tag_name: OpenWrt_${{ env.FILE_DATE }}
-        files: |
-          ${{ env.FIRMWARE }}/*.bin
-          ${{ env.FIRMWARE }}/*.img
-          ${{ env.FIRMWARE }}/*.gz
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
