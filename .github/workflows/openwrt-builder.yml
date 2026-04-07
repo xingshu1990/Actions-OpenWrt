@@ -1,12 +1,31 @@
-name: OpenWrt Cache Analyzer
+#
+# https://github.com/P3TERX/Actions-OpenWrt
+#
+# File: .github/workflows/openwrt-bulder.yml
+# Description: Build OpenWrt using GitHub Actions
+#
+# Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
+#
+# This is free software, licensed under the MIT License.
+# See /LICENSE for more information.
+#
+
+name: OpenWrt Builder
 
 on:
+  repository_dispatch:
   workflow_dispatch:
 
 env:
   REPO_URL: https://github.com/coolsnowwolf/lede
   REPO_BRANCH: master
+  FEEDS_CONF: feeds.conf.default
   CONFIG_FILE: .config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
 
 jobs:
@@ -15,67 +34,35 @@ jobs:
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@main
 
-    - name: Init environment
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
       run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y build-essential clang flex bison g++ gawk \
-        gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
-        python3 python3-pyelftools rsync unzip zlib1g-dev file wget ccache time
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
 
-    - name: Clone OpenWrt source
-      run: git clone $REPO_URL -b $REPO_BRANCH openwrt
-
-    - name: Load config
+    - name: Clone source code
+      working-directory: /workdir
       run: |
-        cp $CONFIG_FILE openwrt/.config
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: Load custom feeds
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
         cd openwrt
-        make defconfig
-
-    # 🔑 缓存 Key（不包含 commit）
-    - name: Generate cache key
-      run: |
-        cd openwrt
-        grep -v "^#" .config | sort > config.seed
-        CONFIG_HASH=$(md5sum config.seed | cut -d ' ' -f1)
-        FEEDS_HASH=$(md5sum feeds.conf.default 2>/dev/null | cut -d ' ' -f1 || echo "nofeeds")
-        FINAL_KEY="${CONFIG_HASH}-${FEEDS_HASH}"
-        echo "CACHE_KEY=$FINAL_KEY" >> $GITHUB_ENV
-        echo "📌 Cache Key: $FINAL_KEY"
-
-    - name: Cache dl
-      id: cache_dl
-      uses: actions/cache@v4
-      with:
-        path: openwrt/dl
-        key: ${{ runner.os }}-dl-${{ env.CACHE_KEY }}
-        restore-keys: ${{ runner.os }}-dl-
-
-    - name: Cache toolchain
-      id: cache_toolchain
-      uses: actions/cache@v4
-      with:
-        path: openwrt/staging_dir
-        key: ${{ runner.os }}-staging-${{ env.CACHE_KEY }}
-        restore-keys: |
-          ${{ runner.os }}-staging-${{ env.CACHE_KEY }}
-          ${{ runner.os }}-staging-
-
-    - name: Cache ccache
-      id: cache_ccache
-      uses: actions/cache@v4
-      with:
-        path: ~/.ccache
-        key: ${{ runner.os }}-ccache-v2
-        restore-keys: ${{ runner.os }}-ccache-
-
-    - name: Setup ccache
-      run: |
-        echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
-        echo "CCACHE_DIR=~/.ccache" >> $GITHUB_ENV
-        echo "CCACHE_MAXSIZE=5G" >> $GITHUB_ENV
-        ccache -s
+        $GITHUB_WORKSPACE/$DIY_P1_SH
 
     - name: Update feeds
       run: cd openwrt && ./scripts/feeds update -a
@@ -83,201 +70,91 @@ jobs:
     - name: Install feeds
       run: cd openwrt && ./scripts/feeds install -a
 
-    - name: Download packages
+    - name: Load custom configuration
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Download package
+      id: package
       run: |
         cd openwrt
-        make download -j$(nproc)
-        find dl -size 0 -delete 2>/dev/null || true
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
 
-    # ✅ 核心编译步骤 - 保持你原来的简洁逻辑
-    - name: Compile OpenWrt
+    - name: Compile the firmware
       id: compile
       run: |
         cd openwrt
-        
-        START=$(date +%s)
-        
-        if make -j$(nproc) 2>&1 | tee build.log; then
-          echo "BUILD_OK=1" >> $GITHUB_ENV
-          echo "✅ Build successful!"
-        else
-          echo "BUILD_OK=0" >> $GITHUB_ENV
-          echo "⚠️ Build failed, running verbose build..."
-          make -j1 V=s 2>&1 | tee build-single.log
-        fi
-        
-        END=$(date +%s)
-        echo "BUILD_TIME=$((END-START))" >> $GITHUB_ENV
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
 
-    # 📊 缓存分析（你原来就有的）
-    - name: Cache status after build
-      run: |
-        echo "=== CCACHE STATUS AFTER BUILD ==="
-        ccache -s > after_ccache.txt
-        cat after_ccache.txt
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
 
-    - name: Analyze cache
-      run: |
-        echo "================================"
-        echo "📊 CACHE ANALYSIS REPORT"
-        echo "================================"
-        echo ""
-        echo "🔑 Cache Key: $CACHE_KEY"
-        echo ""
-        echo "📦 Cache Hit Status:"
-        echo "   DL:        ${{ steps.cache_dl.outputs.cache-hit }}"
-        echo "   Toolchain: ${{ steps.cache_toolchain.outputs.cache-hit }}"
-        echo "   CCache:    ${{ steps.cache_ccache.outputs.cache-hit }}"
-        echo ""
-        echo "⏱️ Build Time: $BUILD_TIME seconds ($((BUILD_TIME/60)) minutes)"
-        echo ""
-        echo "⚡ CCache Stats:"
-        grep -E "cache (hit|miss)" openwrt/after_ccache.txt 2>/dev/null || true
-
-    # 🔧 准备固件文件
-    - name: Prepare firmware files
-      if: env.BUILD_OK == 1
-      run: |
-        cd openwrt
-        
-        # 查找固件目录（x86 特定路径）
-        FW_DIR=""
-        if [ -d "bin/targets/x86/64" ]; then
-          FW_DIR="bin/targets/x86/64"
-        elif [ -d "bin/targets/x86/generic" ]; then
-          FW_DIR="bin/targets/x86/generic"
-        else
-          # 通用查找：找包含 .img 或 .vdi 文件的目录
-          FW_DIR=$(find bin/targets -type f \( -name "*.img" -o -name "*.vdi" -o -name "*.gz" \) -exec dirname {} \; 2>/dev/null | head -1)
-        fi
-        
-        if [ -n "$FW_DIR" ] && [ -d "$FW_DIR" ]; then
-          echo "✅ Firmware directory: $FW_DIR"
-          echo "FW_DIR=$FW_DIR" >> $GITHUB_ENV
-          
-          # 列出固件文件
-          echo ""
-          echo "=== FIRMWARE FILES ==="
-          ls -lh $FW_DIR/ | grep -E "\.(img|vdi|gz|bin|manifest)" || echo "⚠️ No firmware files found!"
-          
-          # 统计固件文件数量
-          FW_COUNT=$(ls $FW_DIR/*.img* $FW_DIR/*.vdi* $FW_DIR/*.gz $FW_DIR/*.bin 2>/dev/null | wc -l)
-          echo "FW_COUNT=$FW_COUNT" >> $GITHUB_ENV
-          
-          if [ "$FW_COUNT" -eq 0 ]; then
-            echo "⚠️ Warning: No firmware files generated!"
-            echo "   This may be normal if .config only builds packages."
-            echo "   Available files in $FW_DIR:"
-            ls -la $FW_DIR/
-          else
-            echo "✅ Found $FW_COUNT firmware file(s)"
-          fi
-        else
-          echo "⚠️ Firmware directory not found!"
-          echo "   Build output structure:"
-          find bin -type d 2>/dev/null | head -10
-        fi
-      shell: bash
-
-    # 📤 上传固件到 Actions 工件
-    - name: Upload firmware to Actions
-      if: env.BUILD_OK == 1 && env.FW_DIR != ''
-      uses: actions/upload-artifact@v4
+    - name: Upload bin directory
+      uses: actions/upload-artifact@main
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
       with:
-        name: openwrt-firmware
-        path: openwrt/${{ env.FW_DIR }}/
-        retention-days: 7
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
 
-    # 📦 上传 IPK 包到 Actions 工件（可选）
-    - name: Upload packages to Actions
-      if: env.BUILD_OK == 1
-      uses: actions/upload-artifact@v4
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
       with:
-        name: openwrt-packages
-        path: |
-          openwrt/bin/packages/
-          openwrt/bin/targets/*/packages/
-        retention-days: 7
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
 
-    # 🏷️ 生成 Release 标签
     - name: Generate release tag
       id: tag
-      if: env.BUILD_OK == 1 && env.FW_COUNT != 0 && env.FW_COUNT != ''
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
       run: |
-        RELEASE_TAG=$(date +"%Y.%m.%d-%H%M")
-        echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
-        echo "RELEASE_TAG=$RELEASE_TAG" >> $GITHUB_ENV
-        echo "Release tag: $RELEASE_TAG"
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        touch release.txt
+        [ ${UPLOAD_GOFILE} = true && ${{ steps.gofile.outputs.url }} ] && echo "🔗 [GoFile](${{ steps.gofile.outputs.url }})" >> release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
 
-    # 📝 生成 Release 说明
-    - name: Generate release notes
-      if: steps.tag.outputs.release_tag != ''
-      run: |
-        cat > release_notes.txt << EOF
-        ## OpenWrt Firmware Build
-        
-        ### Build Information
-        - **Build Time**: ${{ env.BUILD_TIME }} seconds ($(( ${{ env.BUILD_TIME }} / 60 )) minutes)
-        - **Cache Key**: ${{ env.CACHE_KEY }}
-        - **Build Date**: $(date '+%Y-%m-%d %H:%M:%S')
-        
-        ### Cache Hit Status
-        | Cache Type | Status |
-        |------------|--------|
-        | DL Cache | ${{ steps.cache_dl.outputs.cache-hit }} |
-        | Toolchain | ${{ steps.cache_toolchain.outputs.cache-hit }} |
-        | CCache | ${{ steps.cache_ccache.outputs.cache-hit }} |
-        
-        ### CCache Statistics
-        \`\`\`
-        $(grep -E "cache (hit|miss|hit rate)" openwrt/after_ccache.txt 2>/dev/null || echo "Not available")
-        \`\`\`
-        
-        ### Firmware Files
-        $(cd openwrt/${{ env.FW_DIR }} && ls -lh *.img* *.vdi* *.gz 2>/dev/null | awk '{print "- " $9 " (" $5 ")"}')
-        
-        ### Download
-        Download the firmware files from the assets below.
-        EOF
-        
-        echo "✅ Release notes generated"
-
-    # 🚀 上传到 GitHub Releases
-    - name: Upload to GitHub Releases
-      if: steps.tag.outputs.release_tag != ''
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: ${{ steps.tag.outputs.release_tag }}
-        name: OpenWrt Build ${{ steps.tag.outputs.release_tag }}
-        body_path: release_notes.txt
-        files: |
-          openwrt/${{ env.FW_DIR }}/*.img*
-          openwrt/${{ env.FW_DIR }}/*.vdi*
-          openwrt/${{ env.FW_DIR }}/*.gz
-          openwrt/${{ env.FW_DIR }}/*.bin
-        prerelease: false
-        draft: false
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@master
+      if: steps.tag.outputs.status == 'success' && !cancelled()
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
 
-    # 🧹 清理旧 Releases（保留最近 3 个）
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        retain_days: 0
+        keep_minimum_runs: 2
+
     - name: Remove old Releases
-      if: steps.tag.outputs.release_tag != ''
-      uses: dev-drprasad/delete-older-releases@v0.3.4
+      uses: dev-drprasad/delete-older-releases@master
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
       with:
         keep_latest: 3
         delete_tags: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    # 📤 上传日志
-    - name: Upload logs
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-logs
-        path: |
-          openwrt/build.log
-          openwrt/build-single.log
-          openwrt/after_ccache.txt
-        retention-days: 30
