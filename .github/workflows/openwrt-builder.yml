@@ -28,7 +28,7 @@ env:
   DIY_P2_SH: diy-part2.sh
   
   # 编译优化
-  CCACHE_DIR: /workdir/ccache
+  CCACHE_DIR: ${{ github.workspace }}/ccache
   CCACHE_MAXSIZE: 2G
   
   # 上传配置
@@ -114,14 +114,17 @@ jobs:
         sudo -E apt-get -qq clean
         sudo rm -rf /var/lib/apt/lists/*
         sudo timedatectl set-timezone "$TZ"
-        mkdir -p /workdir
-        sudo chown $USER:$GROUPS /workdir
 
-    # ==================== 4. 恢复缓存（新增）====================
+    # ==================== 4. 恢复缓存（修复权限）====================
+    - name: 创建缓存目录
+      run: |
+        mkdir -p ${{ env.CCACHE_DIR }}
+        mkdir -p ${{ github.workspace }}/dl_cache
+
     - name: 恢复 ccache 缓存
       uses: actions/cache@v3
       with:
-        path: /workdir/ccache
+        path: ${{ env.CCACHE_DIR }}
         key: ccache-${{ runner.os }}-${{ github.ref }}-${{ github.sha }}
         restore-keys: |
           ccache-${{ runner.os }}-${{ github.ref }}-
@@ -130,18 +133,16 @@ jobs:
     - name: 恢复 DL 源码缓存
       uses: actions/cache@v3
       with:
-        path: /workdir/openwrt/dl
-        key: dl-${{ runner.os }}-${{ hashFiles('openwrt/feeds.conf.default') }}-${{ github.sha }}
+        path: ${{ github.workspace }}/dl_cache
+        key: dl-${{ runner.os }}-${{ hashFiles('**/feeds.conf.default') }}-${{ github.sha }}
         restore-keys: |
-          dl-${{ runner.os }}-${{ hashFiles('openwrt/feeds.conf.default') }}-
+          dl-${{ runner.os }}-${{ hashFiles('**/feeds.conf.default') }}-
           dl-${{ runner.os }}-
 
     # ==================== 5. 源码下载 ====================
     - name: 克隆源码（浅克隆加速）
-      working-directory: /workdir
       run: |
         git clone --depth=1 $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
     - name: 加载自定义 feeds 配置
       run: |
@@ -168,6 +169,13 @@ jobs:
           $GITHUB_WORKSPACE/$DIY_P2_SH
         fi
 
+    - name: 恢复 DL 缓存到 openwrt/dl
+      run: |
+        if [ -d "${{ github.workspace }}/dl_cache" ] && [ "$(ls -A ${{ github.workspace }}/dl_cache)" ]; then
+          cp -r ${{ github.workspace }}/dl_cache/* openwrt/dl/ 2>/dev/null || true
+          echo "已恢复 DL 缓存"
+        fi
+
     - name: 下载软件包
       id: package
       run: |
@@ -179,6 +187,13 @@ jobs:
         find dl -size -1024c -exec rm -f {} \;
         echo "download_status=success" >> $GITHUB_OUTPUT
 
+    - name: 备份 DL 缓存
+      run: |
+        if [ -d "openwrt/dl" ] && [ "$(ls -A openwrt/dl)" ]; then
+          cp -r openwrt/dl/* ${{ github.workspace }}/dl_cache/ 2>/dev/null || true
+          echo "已备份 DL 缓存"
+        fi
+
     # ==================== 6. 编译固件 ====================
     - name: 编译固件
       id: compile
@@ -189,7 +204,10 @@ jobs:
         
         # 设置 ccache 环境变量
         export PATH="/usr/lib/ccache:$PATH"
-        export CCACHE_DIR=/workdir/ccache
+        export CCACHE_DIR=${{ env.CCACHE_DIR }}
+        
+        # 显示 ccache 统计信息
+        ccache -s
         
         # 编译主流程
         if make -j$(nproc); then
@@ -212,6 +230,9 @@ jobs:
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
         echo "FILE_TIME=$(date "+%m月%d日-%H点%M分")" >> $GITHUB_ENV
         echo "RELEASE_TAG=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_ENV
+        
+        # 显示 ccache 统计信息
+        ccache -s
 
     - name: 检查磁盘使用情况
       if: always() && steps.compile.outcome != 'skipped'
@@ -256,29 +277,11 @@ jobs:
         - **源码仓库**: ${{ env.REPO_URL }}
         - **源码分支**: ${{ env.REPO_BRANCH }}
         - **编译时间**: ${{ env.FILE_TIME }}
-        - **默认IP**: 192.168.1.1
-        - **默认密码**: password
+        - **默认IP**: 192.168.1.235
+   
         - **时区**: ${{ env.TZ }}
         
-        ## 🔧 包含功能
-        
-        - IPv6 支持
-        - Docker 容器
-        - TTYD 终端
-        - 科学上网插件
-        - 网络加速
-        - 动态DNS
-        - UPnP
-        - 带宽监控
-        - 定时重启
-        - 文件传输
-        - 磁盘管理
-        
-        ## 📝 注意事项
-        
-        1. 首次使用建议不保留配置刷机
-        2. 如遇问题可尝试恢复出厂设置
-        3. 固件仅供学习交流使用
+
         
         ## ✅ 编译状态
         
