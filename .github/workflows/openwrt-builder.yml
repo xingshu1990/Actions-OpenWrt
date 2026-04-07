@@ -134,15 +134,143 @@ jobs:
         echo "⚡ CCache Stats:"
         grep -E "cache (hit|miss)" openwrt/after_ccache.txt 2>/dev/null || true
 
-    # 上传产物
-    - name: Upload firmware
+    # 🔧 准备固件文件
+    - name: Prepare firmware files
       if: env.BUILD_OK == 1
+      run: |
+        cd openwrt
+        
+        # 查找固件目录（x86 特定路径）
+        FW_DIR=""
+        if [ -d "bin/targets/x86/64" ]; then
+          FW_DIR="bin/targets/x86/64"
+        elif [ -d "bin/targets/x86/generic" ]; then
+          FW_DIR="bin/targets/x86/generic"
+        else
+          # 通用查找：找包含 .img 或 .vdi 文件的目录
+          FW_DIR=$(find bin/targets -type f \( -name "*.img" -o -name "*.vdi" -o -name "*.gz" \) -exec dirname {} \; 2>/dev/null | head -1)
+        fi
+        
+        if [ -n "$FW_DIR" ] && [ -d "$FW_DIR" ]; then
+          echo "✅ Firmware directory: $FW_DIR"
+          echo "FW_DIR=$FW_DIR" >> $GITHUB_ENV
+          
+          # 列出固件文件
+          echo ""
+          echo "=== FIRMWARE FILES ==="
+          ls -lh $FW_DIR/ | grep -E "\.(img|vdi|gz|bin|manifest)" || echo "⚠️ No firmware files found!"
+          
+          # 统计固件文件数量
+          FW_COUNT=$(ls $FW_DIR/*.img* $FW_DIR/*.vdi* $FW_DIR/*.gz $FW_DIR/*.bin 2>/dev/null | wc -l)
+          echo "FW_COUNT=$FW_COUNT" >> $GITHUB_ENV
+          
+          if [ "$FW_COUNT" -eq 0 ]; then
+            echo "⚠️ Warning: No firmware files generated!"
+            echo "   This may be normal if .config only builds packages."
+            echo "   Available files in $FW_DIR:"
+            ls -la $FW_DIR/
+          else
+            echo "✅ Found $FW_COUNT firmware file(s)"
+          fi
+        else
+          echo "⚠️ Firmware directory not found!"
+          echo "   Build output structure:"
+          find bin -type d 2>/dev/null | head -10
+        fi
+      shell: bash
+
+    # 📤 上传固件到 Actions 工件
+    - name: Upload firmware to Actions
+      if: env.BUILD_OK == 1 && env.FW_DIR != ''
       uses: actions/upload-artifact@v4
       with:
         name: openwrt-firmware
-        path: openwrt/bin/targets/**/*
+        path: openwrt/${{ env.FW_DIR }}/
         retention-days: 7
 
+    # 📦 上传 IPK 包到 Actions 工件（可选）
+    - name: Upload packages to Actions
+      if: env.BUILD_OK == 1
+      uses: actions/upload-artifact@v4
+      with:
+        name: openwrt-packages
+        path: |
+          openwrt/bin/packages/
+          openwrt/bin/targets/*/packages/
+        retention-days: 7
+
+    # 🏷️ 生成 Release 标签
+    - name: Generate release tag
+      id: tag
+      if: env.BUILD_OK == 1 && env.FW_COUNT != 0 && env.FW_COUNT != ''
+      run: |
+        RELEASE_TAG=$(date +"%Y.%m.%d-%H%M")
+        echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+        echo "RELEASE_TAG=$RELEASE_TAG" >> $GITHUB_ENV
+        echo "Release tag: $RELEASE_TAG"
+
+    # 📝 生成 Release 说明
+    - name: Generate release notes
+      if: steps.tag.outputs.release_tag != ''
+      run: |
+        cat > release_notes.txt << EOF
+        ## OpenWrt Firmware Build
+        
+        ### Build Information
+        - **Build Time**: ${{ env.BUILD_TIME }} seconds ($(( ${{ env.BUILD_TIME }} / 60 )) minutes)
+        - **Cache Key**: ${{ env.CACHE_KEY }}
+        - **Build Date**: $(date '+%Y-%m-%d %H:%M:%S')
+        
+        ### Cache Hit Status
+        | Cache Type | Status |
+        |------------|--------|
+        | DL Cache | ${{ steps.cache_dl.outputs.cache-hit }} |
+        | Toolchain | ${{ steps.cache_toolchain.outputs.cache-hit }} |
+        | CCache | ${{ steps.cache_ccache.outputs.cache-hit }} |
+        
+        ### CCache Statistics
+        \`\`\`
+        $(grep -E "cache (hit|miss|hit rate)" openwrt/after_ccache.txt 2>/dev/null || echo "Not available")
+        \`\`\`
+        
+        ### Firmware Files
+        $(cd openwrt/${{ env.FW_DIR }} && ls -lh *.img* *.vdi* *.gz 2>/dev/null | awk '{print "- " $9 " (" $5 ")"}')
+        
+        ### Download
+        Download the firmware files from the assets below.
+        EOF
+        
+        echo "✅ Release notes generated"
+
+    # 🚀 上传到 GitHub Releases
+    - name: Upload to GitHub Releases
+      if: steps.tag.outputs.release_tag != ''
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        name: OpenWrt Build ${{ steps.tag.outputs.release_tag }}
+        body_path: release_notes.txt
+        files: |
+          openwrt/${{ env.FW_DIR }}/*.img*
+          openwrt/${{ env.FW_DIR }}/*.vdi*
+          openwrt/${{ env.FW_DIR }}/*.gz
+          openwrt/${{ env.FW_DIR }}/*.bin
+        prerelease: false
+        draft: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    # 🧹 清理旧 Releases（保留最近 3 个）
+    - name: Remove old Releases
+      if: steps.tag.outputs.release_tag != ''
+      uses: dev-drprasad/delete-older-releases@v0.3.4
+      with:
+        keep_latest: 3
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    # 📤 上传日志
     - name: Upload logs
       if: always()
       uses: actions/upload-artifact@v4
