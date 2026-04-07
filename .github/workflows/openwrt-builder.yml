@@ -17,154 +17,354 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    # 🧹 环境
-    - name: Init
+    # 🧹 环境准备
+    - name: Init environment
       run: |
         sudo apt-get update -qq
         sudo apt-get install -y build-essential clang flex bison g++ gawk \
         gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
         python3 python3-pyelftools rsync unzip zlib1g-dev file wget ccache time
 
-    # 📦 源码
-    - name: Clone
+    # 📦 克隆源码
+    - name: Clone OpenWrt source
       run: git clone $REPO_URL -b $REPO_BRANCH openwrt
 
-    # ⚙️ config
+    # ⚙️ 加载配置
     - name: Load config
       run: |
         cp $CONFIG_FILE openwrt/.config
         cd openwrt
         make defconfig
 
-    # 🔑 cache key（记录）
+    # 🔑 生成精确的缓存 Key
     - name: Generate cache key
       run: |
         cd openwrt
+        
+        # 计算 .config 的哈希
         grep -v "^#" .config | sort > config.seed
         CONFIG_HASH=$(md5sum config.seed | cut -d ' ' -f1)
-
-        FEEDS_HASH=$(md5sum feeds.conf.default 2>/dev/null | cut -d ' ' -f1 || echo nofeeds)
-
-        FINAL_KEY="${CONFIG_HASH}-${FEEDS_HASH}"
+        
+        # 计算 feeds 配置的哈希
+        FEEDS_HASH=$(md5sum feeds.conf.default 2>/dev/null | cut -d ' ' -f1 || echo "nofeeds")
+        
+        # 获取源码 commit hash（关键！避免缓存污染）
+        SOURCE_COMMIT=$(git rev-parse HEAD | cut -c1-8)
+        
+        # 最终缓存 Key
+        FINAL_KEY="${CONFIG_HASH}-${FEEDS_HASH}-${SOURCE_COMMIT}"
         echo "CACHE_KEY=$FINAL_KEY" >> $GITHUB_ENV
-        echo "📌 CACHE KEY: $FINAL_KEY"
+        
+        # 保存到文件，供分析步骤使用
+        echo "$FINAL_KEY" > cache_key.txt
+        
+        echo "📌 Generated Cache Key: $FINAL_KEY"
+        echo "   - Config hash: $CONFIG_HASH"
+        echo "   - Feeds hash: $FEEDS_HASH"
+        echo "   - Source commit: $SOURCE_COMMIT"
 
-    # 📦 dl cache
+    # 📦 DL 源码包缓存
     - name: Cache dl
       id: cache_dl
       uses: actions/cache@v4
       with:
         path: openwrt/dl
         key: ${{ runner.os }}-dl-${{ env.CACHE_KEY }}
+        restore-keys: |
+          ${{ runner.os }}-dl-
 
-    # 🧠 toolchain cache
+    # 🧠 Toolchain 缓存（精确路径）
     - name: Cache toolchain
       id: cache_toolchain
       uses: actions/cache@v4
       with:
-        path: openwrt/staging_dir
+        path: |
+          openwrt/staging_dir/toolchain-*
+          openwrt/staging_dir/host
         key: ${{ runner.os }}-staging-${{ env.CACHE_KEY }}
+        restore-keys: |
+          ${{ runner.os }}-staging-${{ env.CACHE_KEY }}
+          ${{ runner.os }}-staging-
 
-    # ⚡ ccache
+    # ⚡ CCache 缓存
     - name: Cache ccache
+      id: cache_ccache
       uses: actions/cache@v4
       with:
         path: ~/.ccache
-        key: ${{ runner.os }}-ccache-v1
+        key: ${{ runner.os }}-ccache-${{ env.CACHE_KEY }}
+        restore-keys: |
+          ${{ runner.os }}-ccache-
 
-    - name: Enable ccache
+    # 🔧 配置 CCache
+    - name: Setup ccache
       run: |
-        echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
+        mkdir -p ~/.ccache
         echo "CCACHE_DIR=~/.ccache" >> $GITHUB_ENV
-        echo "CCACHE_MAXSIZE=2G" >> $GITHUB_ENV
+        echo "CCACHE_MAXSIZE=5G" >> $GITHUB_ENV
+        echo "CCACHE_COMPRESS=1" >> $GITHUB_ENV
+        echo "CCACHE_COMPRESSLEVEL=6" >> $GITHUB_ENV
+        echo "CCACHE_AUTOCOMPRESS=1" >> $GITHUB_ENV
+        echo "CCACHE_SLOPPINESS=file_macro,time_macros" >> $GITHUB_ENV
+        
+        # 显示当前 ccache 状态
+        ccache -s
 
-    # 📡 feeds
+    # 📡 更新 feeds
     - name: Update feeds
       run: cd openwrt && ./scripts/feeds update -a
 
     - name: Install feeds
       run: cd openwrt && ./scripts/feeds install -a
 
-    # 📥 下载
-    - name: Download
+    # 📥 下载源码包（只删除空文件）
+    - name: Download packages
       run: |
         cd openwrt
         make download -j$(nproc)
-        find dl -size -1024c -delete
+        # 只删除大小为 0 的文件，避免误删小文件
+        find dl -size 0 -delete 2>/dev/null || true
 
-    # ⏱️ 编译（带时间统计）
-    - name: Compile
+    # 📊 编译前缓存状态
+    - name: Cache status before build
+      run: |
+        echo "=== CCACHE STATUS BEFORE BUILD ==="
+        ccache -s > before_ccache.txt
+        cat before_ccache.txt
+        
+        echo ""
+        echo "=== CACHE HIT STATUS ==="
+        echo "DL Cache hit: ${{ steps.cache_dl.outputs.cache-hit }}"
+        echo "Toolchain Cache hit: ${{ steps.cache_toolchain.outputs.cache-hit }}"
+        echo "CCache Cache hit: ${{ steps.cache_ccache.outputs.cache-hit }}"
+
+    # ⏱️ 编译主程序（带时间统计和错误处理）
+    - name: Compile OpenWrt
       id: compile
       run: |
         cd openwrt
-
-        echo "=== BEFORE BUILD CCACHE ==="
-        ccache -s > before_ccache.txt || true
-
-        START=$(date +%s)
-
-        if make -j$(nproc) 2>&1 | tee build.log; then
-          echo "BUILD_OK=1" >> $GITHUB_ENV
-        else
-          echo "BUILD_OK=0" >> $GITHUB_ENV
+        
+        # 记录开始时间
+        START_TIME=$(date +%s)
+        START_DATETIME=$(date '+%Y-%m-%d %H:%M:%S')
+        echo "Build started at: $START_DATETIME"
+        
+        # 尝试完整编译
+        set +e
+        make -j$(nproc) \
+          CC="ccache gcc" \
+          CXX="ccache g++" \
+          2>&1 | tee build.log
+        
+        BUILD_EXIT_CODE=$?
+        set -e
+        
+        # 记录结束时间
+        END_TIME=$(date +%s)
+        END_DATETIME=$(date '+%Y-%m-%d %H:%M:%S')
+        BUILD_DURATION=$((END_TIME - START_TIME))
+        
+        echo "BUILD_TIME=$BUILD_DURATION" >> $GITHUB_ENV
+        echo "BUILD_EXIT_CODE=$BUILD_EXIT_CODE" >> $GITHUB_ENV
+        echo "Build finished at: $END_DATETIME"
+        echo "Total build time: $((BUILD_DURATION / 60)) minutes $((BUILD_DURATION % 60)) seconds"
+        
+        # 如果编译失败，尝试单线程详细输出
+        if [ $BUILD_EXIT_CODE -ne 0 ]; then
+          echo "⚠️ Build failed with exit code $BUILD_EXIT_CODE"
+          echo "Running single-threaded verbose build for debugging..."
           make -j1 V=s 2>&1 | tee build-single.log
+        else
+          echo "✅ Build successful!"
+          
+          # 查找编译产物
+          echo ""
+          echo "=== BUILD ARTIFACTS ==="
+          find bin/targets/ -name "*.img" -o -name "*.bin" -o -name "*.gz" 2>/dev/null | head -20
         fi
 
-        END=$(date +%s)
-        echo "BUILD_TIME=$((END-START))" >> $GITHUB_ENV
-
-        echo "=== AFTER BUILD CCACHE ==="
-        ccache -s > after_ccache.txt || true
-
-    # 📊 分析缓存（核心🔥）
-    - name: Analyze cache
+    # 📊 编译后缓存状态
+    - name: Cache status after build
       run: |
-        echo "============================"
-        echo "📊 CACHE ANALYSIS REPORT"
-        echo "============================"
+        echo "=== CCACHE STATUS AFTER BUILD ==="
+        ccache -s > after_ccache.txt
+        cat after_ccache.txt
 
+    # 📈 完整的缓存分析报告
+    - name: Analyze cache performance
+      run: |
+        echo "================================"
+        echo "📊 OPENWRT CACHE ANALYSIS REPORT"
+        echo "================================"
         echo ""
-        echo "🧩 Cache Key:"
-        echo "$CACHE_KEY"
-
+        
+        echo "🔑 Cache Information:"
+        echo "   Cache Key: $CACHE_KEY"
+        if [ -f openwrt/cache_key.txt ]; then
+          echo "   Saved to: cache_key.txt"
+        fi
         echo ""
-        echo "📦 DL Cache:"
-        echo "Hit: ${{ steps.cache_dl.outputs.cache-hit }}"
-
+        
+        echo "📦 Cache Hit Status:"
+        echo "   ├─ DL Cache:      ${{ steps.cache_dl.outputs.cache-hit }}"
+        echo "   ├─ Toolchain:     ${{ steps.cache_toolchain.outputs.cache-hit }}"
+        echo "   └─ CCache:        ${{ steps.cache_ccache.outputs.cache-hit }}"
         echo ""
-        echo "🧠 Toolchain Cache:"
-        echo "Hit: ${{ steps.cache_toolchain.outputs.cache-hit }}"
-
+        
+        echo "⚡ CCache Statistics:"
+        if [ -f openwrt/after_ccache.txt ]; then
+          HITS=$(grep "cache hit" openwrt/after_ccache.txt | awk '{print $4}' | tr -d '(' | tr -d ')' | head -1 || echo "0")
+          MISSES=$(grep "cache miss" openwrt/after_ccache.txt | awk '{print $4}' | tr -d '(' | tr -d ')' | head -1 || echo "0")
+          HIT_RATE=$(grep "cache hit rate" openwrt/after_ccache.txt | awk '{print $5}' || echo "N/A")
+          
+          echo "   ├─ Cache hits:   ${HITS:-0}"
+          echo "   ├─ Cache misses: ${MISSES:-0}"
+          echo "   └─ Hit rate:     ${HIT_RATE:-N/A}"
+          
+          # 保存到环境变量供后续使用
+          echo "CCACHE_HITS=${HITS:-0}" >> $GITHUB_ENV
+          echo "CCACHE_MISSES=${MISSES:-0}" >> $GITHUB_ENV
+        else
+          echo "   ❌ CCache stats not available"
+        fi
         echo ""
-        echo "⚡ CCache Stats:"
-        cat openwrt/after_ccache.txt | grep "cache hit" || true
-        cat openwrt/after_ccache.txt | grep "cache miss" || true
-
-        echo ""
+        
         echo "⏱️ Build Time:"
-        echo "$BUILD_TIME seconds"
-
+        if [ -n "$BUILD_TIME" ]; then
+          MINS=$((BUILD_TIME / 60))
+          SECS=$((BUILD_TIME % 60))
+          echo "   └─ ${MINS} minutes ${SECS} seconds (${BUILD_TIME} seconds total)"
+        else
+          echo "   └─ ❌ Build time not recorded"
+        fi
         echo ""
-        echo "📉 判断："
+        
+        echo "🎯 Performance Analysis:"
+        echo "   ┌─────────────────────────────────────────────────────┐"
+        
+        # 分析 Toolchain 缓存效果
+        if [ "${{ steps.cache_toolchain.outputs.cache-hit }}" = "true" ]; then
+          echo "   │ ✅ Toolchain HIT - Good!                           │"
+          if [ "$BUILD_TIME" -lt 600 ]; then
+            echo "   │ 🏆 Excellent: Build completed in < 10 minutes      │"
+          elif [ "$BUILD_TIME" -lt 1200 ]; then
+            echo "   │ 👍 Good: Build completed in 10-20 minutes          │"
+          else
+            echo "   │ ⚠️ Slow: Toolchain hit but build > 20 minutes      │"
+            echo "   │   Possible: CCache miss or many package changes    │"
+          fi
+        else
+          echo "   │ ❌ Toolchain MISS - Expected for first build       │"
+          echo "   │   First-time build typically takes 20-40 minutes   │"
+        fi
+        echo "   │                                                     │"
+        
+        # 分析 CCache 效果
+        if [ -n "$CCACHE_HITS" ] && [ -n "$CCACHE_MISSES" ]; then
+          TOTAL=$((CCACHE_HITS + CCACHE_MISSES))
+          if [ $TOTAL -gt 0 ]; then
+            RATE=$((CCACHE_HITS * 100 / TOTAL))
+            if [ $RATE -gt 50 ]; then
+              echo "   │ ✅ CCache rate ${RATE}% - Good cache utilization     │"
+            elif [ $RATE -gt 20 ]; then
+              echo "   │ 📊 CCache rate ${RATE}% - Moderate utilization       │"
+            else
+              echo "   │ ⚠️ CCache rate ${RATE}% - Low utilization           │"
+              echo "   │   Consider checking config/source changes          │"
+            fi
+          fi
+        fi
+        echo "   │                                                     │"
+        
+        # 分析 DL 缓存
+        if [ "${{ steps.cache_dl.outputs.cache-hit }}" = "true" ]; then
+          echo "   │ ✅ DL Cache HIT - No re-download needed            │"
+        else
+          echo "   │ ⚠️ DL Cache MISS - Packages will be downloaded     │"
+        fi
+        echo "   │                                                     │"
+        
+        # 构建结论
+        if [ "${{ steps.cache_toolchain.outputs.cache-hit }}" = "true" ] && [ "$BUILD_TIME" -lt 600 ]; then
+          echo "   │ 🎉 CONCLUSION: Cache is working perfectly!         │"
+        elif [ "${{ steps.cache_toolchain.outputs.cache-hit }}" = "true" ]; then
+          echo "   │ 📈 CONCLUSION: Cache helps but can be optimized    │"
+        else
+          echo "   │ 🔄 CONCLUSION: First build or major changes        │"
+          echo "   │   Next build will be much faster!                  │"
+        fi
+        echo "   └─────────────────────────────────────────────────────┘"
+        echo ""
+        
+        echo "💡 Recommendations:"
         if [ "${{ steps.cache_toolchain.outputs.cache-hit }}" != "true" ]; then
-          echo "❗ Toolchain未命中 → 编译慢（正常）"
+          echo "   • Run this workflow again to benefit from toolchain cache"
         fi
-
+        if [ -n "$CCACHE_HITS" ] && [ -n "$CCACHE_MISSES" ] && [ $((CCACHE_HITS * 100 / (CCACHE_HITS + CCACHE_MISSES))) -lt 30 ]; then
+          echo "   • Consider reducing changes to .config between builds"
+          echo "   • Use 'make defconfig' less frequently if possible"
+        fi
         if [ "${{ steps.cache_dl.outputs.cache-hit }}" != "true" ]; then
-          echo "❗ DL未命中 → 重新下载"
+          echo "   • DL cache miss adds network latency to builds"
         fi
 
-        if grep -q "miss" openwrt/after_ccache.txt; then
-          echo "❗ CCache未充分命中 → 可能config/源码变化"
-        fi
-
-    # 📤 上传分析日志
-    - name: Upload analysis
+    # 📤 上传编译产物（如果成功）
+    - name: Upload firmware artifacts
+      if: success() && env.BUILD_EXIT_CODE == 0
       uses: actions/upload-artifact@v4
       with:
-        name: cache-analysis
+        name: openwrt-firmware
+        path: |
+          openwrt/bin/targets/**/*.img
+          openwrt/bin/targets/**/*.bin
+          openwrt/bin/targets/**/*.gz
+          openwrt/bin/targets/**/*.manifest
+        compression-level: 9
+        retention-days: 7
+
+    # 📤 上传分析日志
+    - name: Upload analysis logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: cache-analysis-logs
         path: |
           openwrt/build.log
           openwrt/build-single.log
           openwrt/before_ccache.txt
           openwrt/after_ccache.txt
+          openwrt/cache_key.txt
+          openwrt/config.seed
+        compression-level: 9
+        retention-days: 30
+
+    # 📤 上传完整的编译日志（用于调试）
+    - name: Upload full build log
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: full-build-log
+        path: |
+          openwrt/build.log
+          openwrt/build-single.log
+          openwrt/.config
+        compression-level: 9
+        retention-days: 90
+
+    # 🧹 清理工作（可选）
+    - name: Cleanup
+      if: always()
+      run: |
+        echo "🧹 Cleaning up temporary files..."
+        # 保留 ccache，清理其他临时文件
+        rm -rf openwrt/tmp 2>/dev/null || true
+        rm -rf openwrt/logs 2>/dev/null || true
+        echo "✅ Cleanup completed"
+        
+        # 显示磁盘使用情况
+        echo ""
+        echo "=== DISK USAGE ==="
+        df -h
+        echo ""
+        echo "=== CCACHE FINAL SIZE ==="
+        ccache -s | grep "cache size" || true
