@@ -29,7 +29,7 @@ env:
   
   # 编译优化
   CCACHE_DIR: ${{ github.workspace }}/ccache
-  CCACHE_MAXSIZE: 2G
+  CCACHE_MAXSIZE: 5G
   
   # 上传配置
   UPLOAD_BIN_DIR: false
@@ -49,51 +49,7 @@ jobs:
     - name: 检出代码
       uses: actions/checkout@main
 
-    # ==================== 2. 磁盘空间优化（融合版）====================
-    - name: 检查磁盘空间（优化前）
-      run: |
-        echo "=== 磁盘空间使用情况（优化前）==="
-        df -hT
-        echo "=== 磁盘空间详情 ==="
-        sudo du -sh /opt /usr/local /var/cache/apt 2>/dev/null || true
-
-    - name: 通用磁盘空间优化
-      uses: hugoalh/disk-space-optimizer-ghaction@v0.8.0
-      with:
-        operate_sudo: "True"
-        general_include: ".+"
-        general_exclude: |-
-          ^GCC$
-          ^G\+\+$
-          Clang
-          LLVM
-        docker_include: ".+"
-        docker_prune: "True"
-        docker_clean: "True"
-        apt_prune: "True"
-        apt_clean: "True"
-        npm_prune: "True"
-        npm_clean: "True"
-
-    - name: 深度磁盘空间释放
-      uses: easimon/maximize-build-space@master
-      with: 
-        root-reserve-mb: 2048
-        swap-size-mb: 1
-        remove-dotnet: 'true'
-        remove-android: 'true'
-        remove-haskell: 'true'
-        remove-codeql: 'true'
-        remove-docker-images: 'true'
-
-    - name: 检查磁盘空间（优化后）
-      run: |
-        echo "=== 磁盘空间使用情况（优化后）==="
-        df -hT
-        echo "=== 可用编译空间 ==="
-        echo "$(df -h . | awk 'NR==2 {print $4}')"
-
-    # ==================== 3. 编译环境准备 ====================
+    # ==================== 2. 编译环境准备 ====================
     - name: Initialization environment
       env:
         DEBIAN_FRONTEND: noninteractive
@@ -107,7 +63,8 @@ jobs:
         sudo timedatectl set-timezone "$TZ"
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
-    # ==================== 4. 恢复缓存（修复权限）====================
+
+    # ==================== 3. 恢复缓存（修复权限）====================
     - name: 创建缓存目录
       run: |
         mkdir -p ${{ env.CCACHE_DIR }}
@@ -131,7 +88,7 @@ jobs:
           dl-${{ runner.os }}-${{ hashFiles('**/feeds.conf.default') }}-
           dl-${{ runner.os }}-
 
-    # ==================== 5. 源码下载 ====================
+    # ==================== 4. 源码下载 ====================
     - name: 克隆源码（浅克隆加速）
       run: |
         git clone --depth=1 $REPO_URL -b $REPO_BRANCH openwrt
@@ -186,7 +143,7 @@ jobs:
           echo "已备份 DL 缓存"
         fi
 
-    # ==================== 6. 编译固件 ====================
+    # ==================== 5. 编译固件 ====================
     - name: 编译固件
       id: compile
       if: github.event.inputs.test_mode != 'true'
@@ -230,7 +187,7 @@ jobs:
       if: always() && steps.compile.outcome != 'skipped'
       run: df -hT
 
-    # ==================== 7. 上传文件 ====================
+    # ==================== 6. 上传文件 ====================
     - name: 上传 bin 目录
       uses: actions/upload-artifact@main
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
@@ -255,7 +212,7 @@ jobs:
         name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
 
-    # ==================== 8. 发布 Release（增强版）====================
+    # ==================== 7. 发布 Release（增强版）====================
     - name: 生成 Release 说明
       id: tag
       if: env.UPLOAD_RELEASE == 'true' && steps.compile.outputs.status == 'success'
@@ -270,16 +227,13 @@ jobs:
         - **源码分支**: ${{ env.REPO_BRANCH }}
         - **编译时间**: ${{ env.FILE_TIME }}
         - **默认IP**: 192.168.1.235
-   
         - **时区**: ${{ env.TZ }}
-        
-
         
         ## ✅ 编译状态
         
         - 状态: 成功 ✅
         - 线程数: $(nproc)
-        - 缓存: ccache 已启用
+        - 缓存: ccache 已启用 (${{ env.CCACHE_MAXSIZE }})
         EOF
         
         echo "status=success" >> $GITHUB_OUTPUT
@@ -297,7 +251,7 @@ jobs:
         draft: false
         prerelease: false
 
-    # ==================== 9. 清理维护 ====================
+    # ==================== 8. 清理维护 ====================
     - name: 清理旧的 Workflow 运行记录
       uses: Mattraks/delete-workflow-runs@main
       with:
