@@ -1,31 +1,12 @@
-#
-# https://github.com/P3TERX/Actions-OpenWrt
-#
-# File: .github/workflows/openwrt-bulder.yml
-# Description: Build OpenWrt using GitHub Actions
-#
-# Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
-#
-
-name: OpenWrt Builder
+name: OpenWrt Cache Analyzer
 
 on:
-  repository_dispatch:
   workflow_dispatch:
 
 env:
   REPO_URL: https://github.com/coolsnowwolf/lede
   REPO_BRANCH: master
-  FEEDS_CONF: feeds.conf.default
   CONFIG_FILE: .config
-  DIY_P1_SH: diy-part1.sh
-  DIY_P2_SH: diy-part2.sh
-  UPLOAD_BIN_DIR: false
-  UPLOAD_FIRMWARE: true
-  UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
 
 jobs:
@@ -34,127 +15,156 @@ jobs:
 
     steps:
     - name: Checkout
-      uses: actions/checkout@main
+      uses: actions/checkout@v4
 
-    - name: Initialization environment
-      env:
-        DEBIAN_FRONTEND: noninteractive
+    # 🧹 环境
+    - name: Init
       run: |
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-        sudo docker image prune --all --force
-        sudo -E apt-get -qq update
-        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
-        sudo -E apt-get -qq autoremove --purge
-        sudo -E apt-get -qq clean
-        sudo timedatectl set-timezone "$TZ"
-        sudo mkdir -p /workdir
-        sudo chown $USER:$GROUPS /workdir
+        sudo apt-get update -qq
+        sudo apt-get install -y build-essential clang flex bison g++ gawk \
+        gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+        python3 python3-pyelftools rsync unzip zlib1g-dev file wget ccache time
 
-    - name: Clone source code
-      working-directory: /workdir
-      run: |
-        df -hT $PWD
-        git clone $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+    # 📦 源码
+    - name: Clone
+      run: git clone $REPO_URL -b $REPO_BRANCH openwrt
 
-    - name: Load custom feeds
+    # ⚙️ config
+    - name: Load config
       run: |
-        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
-        chmod +x $DIY_P1_SH
+        cp $CONFIG_FILE openwrt/.config
         cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P1_SH
+        make defconfig
 
+    # 🔑 cache key（记录）
+    - name: Generate cache key
+      run: |
+        cd openwrt
+        grep -v "^#" .config | sort > config.seed
+        CONFIG_HASH=$(md5sum config.seed | cut -d ' ' -f1)
+
+        FEEDS_HASH=$(md5sum feeds.conf.default 2>/dev/null | cut -d ' ' -f1 || echo nofeeds)
+
+        FINAL_KEY="${CONFIG_HASH}-${FEEDS_HASH}"
+        echo "CACHE_KEY=$FINAL_KEY" >> $GITHUB_ENV
+        echo "📌 CACHE KEY: $FINAL_KEY"
+
+    # 📦 dl cache
+    - name: Cache dl
+      id: cache_dl
+      uses: actions/cache@v4
+      with:
+        path: openwrt/dl
+        key: ${{ runner.os }}-dl-${{ env.CACHE_KEY }}
+
+    # 🧠 toolchain cache
+    - name: Cache toolchain
+      id: cache_toolchain
+      uses: actions/cache@v4
+      with:
+        path: openwrt/staging_dir
+        key: ${{ runner.os }}-staging-${{ env.CACHE_KEY }}
+
+    # ⚡ ccache
+    - name: Cache ccache
+      uses: actions/cache@v4
+      with:
+        path: ~/.ccache
+        key: ${{ runner.os }}-ccache-v1
+
+    - name: Enable ccache
+      run: |
+        echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
+        echo "CCACHE_DIR=~/.ccache" >> $GITHUB_ENV
+        echo "CCACHE_MAXSIZE=2G" >> $GITHUB_ENV
+
+    # 📡 feeds
     - name: Update feeds
       run: cd openwrt && ./scripts/feeds update -a
 
     - name: Install feeds
       run: cd openwrt && ./scripts/feeds install -a
 
-    - name: Load custom configuration
-      run: |
-        [ -e files ] && mv files openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
-        chmod +x $DIY_P2_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P2_SH
-
-    - name: Download package
-      id: package
+    # 📥 下载
+    - name: Download
       run: |
         cd openwrt
-        make defconfig
-        make download -j8
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
+        make download -j$(nproc)
+        find dl -size -1024c -delete
 
-    - name: Compile the firmware
+    # ⏱️ 编译（带时间统计）
+    - name: Compile
       id: compile
       run: |
         cd openwrt
-        echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
-        echo "status=success" >> $GITHUB_OUTPUT
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
-        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
 
-    - name: Check space usage
-      if: (!cancelled())
-      run: df -hT
+        echo "=== BEFORE BUILD CCACHE ==="
+        ccache -s > before_ccache.txt || true
 
-    - name: Upload bin directory
-      uses: actions/upload-artifact@main
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
-      with:
-        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: openwrt/bin
+        START=$(date +%s)
 
-    - name: Organize files
-      id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+        if make -j$(nproc) 2>&1 | tee build.log; then
+          echo "BUILD_OK=1" >> $GITHUB_ENV
+        else
+          echo "BUILD_OK=0" >> $GITHUB_ENV
+          make -j1 V=s 2>&1 | tee build-single.log
+        fi
+
+        END=$(date +%s)
+        echo "BUILD_TIME=$((END-START))" >> $GITHUB_ENV
+
+        echo "=== AFTER BUILD CCACHE ==="
+        ccache -s > after_ccache.txt || true
+
+    # 📊 分析缓存（核心🔥）
+    - name: Analyze cache
       run: |
-        cd openwrt/bin/targets/*/*
-        rm -rf packages
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "status=success" >> $GITHUB_OUTPUT
+        echo "============================"
+        echo "📊 CACHE ANALYSIS REPORT"
+        echo "============================"
 
-    - name: Upload firmware directory
-      uses: actions/upload-artifact@main
-      if: steps.organize.outputs.status == 'success' && !cancelled()
+        echo ""
+        echo "🧩 Cache Key:"
+        echo "$CACHE_KEY"
+
+        echo ""
+        echo "📦 DL Cache:"
+        echo "Hit: ${{ steps.cache_dl.outputs.cache-hit }}"
+
+        echo ""
+        echo "🧠 Toolchain Cache:"
+        echo "Hit: ${{ steps.cache_toolchain.outputs.cache-hit }}"
+
+        echo ""
+        echo "⚡ CCache Stats:"
+        cat openwrt/after_ccache.txt | grep "cache hit" || true
+        cat openwrt/after_ccache.txt | grep "cache miss" || true
+
+        echo ""
+        echo "⏱️ Build Time:"
+        echo "$BUILD_TIME seconds"
+
+        echo ""
+        echo "📉 判断："
+        if [ "${{ steps.cache_toolchain.outputs.cache-hit }}" != "true" ]; then
+          echo "❗ Toolchain未命中 → 编译慢（正常）"
+        fi
+
+        if [ "${{ steps.cache_dl.outputs.cache-hit }}" != "true" ]; then
+          echo "❗ DL未命中 → 重新下载"
+        fi
+
+        if grep -q "miss" openwrt/after_ccache.txt; then
+          echo "❗ CCache未充分命中 → 可能config/源码变化"
+        fi
+
+    # 📤 上传分析日志
+    - name: Upload analysis
+      uses: actions/upload-artifact@v4
       with:
-        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE }}
-
-    - name: Generate release tag
-      id: tag
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      run: |
-        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
-        touch release.txt
-        [ ${UPLOAD_GOFILE} = true && ${{ steps.gofile.outputs.url }} ] && echo "🔗 [GoFile](${{ steps.gofile.outputs.url }})" >> release.txt
-        echo "status=success" >> $GITHUB_OUTPUT
-
-    - name: Upload firmware to release
-      uses: softprops/action-gh-release@master
-      if: steps.tag.outputs.status == 'success' && !cancelled()
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.tag.outputs.release_tag }}
-        body_path: release.txt
-        files: ${{ env.FIRMWARE }}/*
-
-    - name: Delete workflow runs
-      uses: Mattraks/delete-workflow-runs@main
-      with:
-        retain_days: 0
-        keep_minimum_runs: 2
-
-    - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@master
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      with:
-        keep_latest: 3
-        delete_tags: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        name: cache-analysis
+        path: |
+          openwrt/build.log
+          openwrt/build-single.log
+          openwrt/before_ccache.txt
+          openwrt/after_ccache.txt
