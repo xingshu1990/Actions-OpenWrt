@@ -97,11 +97,12 @@ jobs:
 
     - name: 加载自定义 feeds 配置
       run: |
-        [ -e $FEEDS_CONF ] && cp $FEEDS_CONF openwrt/feeds.conf.default
+        if [ -e $FEEDS_CONF ]; then
+          cp $FEEDS_CONF openwrt/feeds.conf.default
+        fi
         if [ -f $DIY_P1_SH ]; then
           chmod +x $DIY_P1_SH
-          cd openwrt
-          $GITHUB_WORKSPACE/$DIY_P1_SH
+          (cd openwrt && $GITHUB_WORKSPACE/$DIY_P1_SH)
         fi
 
     - name: 更新 feeds
@@ -112,25 +113,36 @@ jobs:
 
     - name: 加载自定义配置
       run: |
-        [ -e files ] && cp -r files openwrt/
-        [ -e $CONFIG_FILE ] && cp $CONFIG_FILE openwrt/.config
+        # 复制文件目录（如果存在）
+        if [ -e files ]; then
+          cp -r files openwrt/
+        fi
+        
+        # 复制配置文件（如果存在）
+        if [ -e $CONFIG_FILE ]; then
+          cp $CONFIG_FILE openwrt/.config
+        fi
+        
+        # 执行自定义脚本
         if [ -f $DIY_P2_SH ]; then
           chmod +x $DIY_P2_SH
-          cd openwrt
-          $GITHUB_WORKSPACE/$DIY_P2_SH
+          (cd openwrt && $GITHUB_WORKSPACE/$DIY_P2_SH)
         fi
         
         # 新增：确保生成IPK包的配置
-        cd openwrt
-        # 启用生成所有IPK包（如果.config中没有启用）
-        if ! grep -q "CONFIG_IPK_FILES" .config 2>/dev/null; then
-          echo '# 启用IPK包生成' >> .config
-          echo 'CONFIG_IPK_FILES=y' >> .config
+        if [ -f openwrt/.config ]; then
+          cd openwrt
+          # 启用生成所有IPK包（如果.config中没有启用）
+          if ! grep -q "CONFIG_IPK_FILES" .config 2>/dev/null; then
+            echo '# 启用IPK包生成' >> .config
+            echo 'CONFIG_IPK_FILES=y' >> .config
+          fi
         fi
 
     - name: 恢复 DL 缓存到 openwrt/dl
       run: |
         if [ -d "${{ github.workspace }}/dl_cache" ] && [ "$(ls -A ${{ github.workspace }}/dl_cache)" ]; then
+          mkdir -p openwrt/dl
           cp -r ${{ github.workspace }}/dl_cache/* openwrt/dl/ 2>/dev/null || true
           echo "已恢复 DL 缓存"
         fi
@@ -149,6 +161,7 @@ jobs:
     - name: 备份 DL 缓存
       run: |
         if [ -d "openwrt/dl" ] && [ "$(ls -A openwrt/dl)" ]; then
+          mkdir -p ${{ github.workspace }}/dl_cache
           cp -r openwrt/dl/* ${{ github.workspace }}/dl_cache/ 2>/dev/null || true
           echo "已备份 DL 缓存"
         fi
@@ -182,8 +195,10 @@ jobs:
         echo "status=success" >> $GITHUB_OUTPUT
         
         # 提取设备名称
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        if grep -q '^CONFIG_TARGET.*DEVICE.*=y' .config; then
+          grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+          [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        fi
         
         # 生成时间戳
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
@@ -205,22 +220,30 @@ jobs:
         
         # 查找所有IPK文件（排除kernel相关）
         echo "正在收集IPK包..."
-        find bin -name "*.ipk" -type f | while read ipk; do
-          # 跳过kernel相关的包（可选）
-          if [[ ! "$ipk" =~ "kernel" ]]; then
-            cp "$ipk" ${{ github.workspace }}/all_packages/
-            echo "已复制: $(basename $ipk)"
-          fi
-        done
+        if [ -d bin ]; then
+          find bin -name "*.ipk" -type f | while read ipk; do
+            # 跳过kernel相关的包（可选）
+            if [[ ! "$ipk" =~ "kernel" ]]; then
+              cp "$ipk" ${{ github.workspace }}/all_packages/
+              echo "已复制: $(basename $ipk)"
+            fi
+          done
+        else
+          echo "警告: bin目录不存在"
+        fi
         
         # 统计收集到的IPK数量
-        PKG_COUNT=$(ls -1 ${{ github.workspace }}/all_packages/*.ipk 2>/dev/null | wc -l)
-        echo "收集到 $PKG_COUNT 个IPK包"
-        echo "package_count=$PKG_COUNT" >> $GITHUB_OUTPUT
-        
-        # 生成包列表
-        ls -lh ${{ github.workspace }}/all_packages/ > ${{ github.workspace }}/package_list.txt
-        echo "packages_dir=${{ github.workspace }}/all_packages" >> $GITHUB_ENV
+        if [ -d "${{ github.workspace }}/all_packages" ]; then
+          PKG_COUNT=$(ls -1 ${{ github.workspace }}/all_packages/*.ipk 2>/dev/null | wc -l)
+          echo "收集到 $PKG_COUNT 个IPK包"
+          echo "package_count=$PKG_COUNT" >> $GITHUB_OUTPUT
+          
+          # 生成包列表
+          ls -lh ${{ github.workspace }}/all_packages/ > ${{ github.workspace }}/package_list.txt
+          echo "packages_dir=${{ github.workspace }}/all_packages" >> $GITHUB_ENV
+        else
+          echo "package_count=0" >> $GITHUB_OUTPUT
+        fi
 
     - name: 上传IPK包作为Artifact
       uses: actions/upload-artifact@main
@@ -229,30 +252,32 @@ jobs:
         name: OpenWrt_packages${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: ${{ env.packages_dir }}
 
-    # ==================== 7. 上传到GitHub Packages ====================
+    # ==================== 7. 上传到GitHub Packages分支 ====================
     - name: 准备Packages分支
       if: steps.collect_packages.outputs.package_count != '0'
       run: |
         # 克隆或创建packages分支
-        git clone --depth=1 --branch=packages https://github.com/${{ github.repository }}.git packages_branch 2>/dev/null || mkdir packages_branch
-        
-        cd packages_branch
-        
-        # 如果不是git仓库，初始化
-        if [ ! -d ".git" ]; then
+        if git ls-remote --heads https://github.com/${{ github.repository }}.git packages | grep -q packages; then
+          git clone --depth=1 --branch=packages https://github.com/${{ github.repository }}.git packages_branch
+        else
+          mkdir packages_branch
+          cd packages_branch
           git init
           git checkout -b packages
           git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
-        else
-          git pull origin packages 2>/dev/null || true
+          cd ..
         fi
+        
+        cd packages_branch
         
         # 创建按日期组织的目录结构
         DATE_DIR=$(date +"%Y/%m/%d")
         mkdir -p $DATE_DIR
         
         # 复制IPK包到对应目录
-        cp ${{ env.packages_dir }}/*.ipk $DATE_DIR/ 2>/dev/null || true
+        if [ -d "${{ env.packages_dir }}" ]; then
+          cp ${{ env.packages_dir }}/*.ipk $DATE_DIR/ 2>/dev/null || true
+        fi
         
         # 生成包索引文件
         cat > README.md << EOF
@@ -262,7 +287,7 @@ jobs:
         
         ### 软件包列表
         
-        $(ls -lh $DATE_DIR/*.ipk 2>/dev/null | awk '{print "- " $9 " (" $5 ")"}')
+        $(ls -lh $DATE_DIR/*.ipk 2>/dev/null | awk '{print "- " $9 " (" $5 ")"}' || echo "暂无软件包")
         
         ### 使用方法
         
@@ -280,7 +305,7 @@ jobs:
         git config user.email "github-actions[bot]@users.noreply.github.com"
         git add .
         git commit -m "Update packages: $(date "+%Y-%m-%d %H:%M:%S")" || echo "无需提交"
-        git push origin packages --force
+        git push origin packages
 
     # ==================== 8. 上传 bin 目录 ====================
     - name: 上传 bin 目录
@@ -295,11 +320,16 @@ jobs:
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && steps.compile.outputs.status == 'success'
       run: |
-        cd openwrt/bin/targets/*/*
-        # 清理不必要的 packages 目录
-        rm -rf packages
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "status=success" >> $GITHUB_OUTPUT
+        if [ -d "openwrt/bin/targets" ]; then
+          cd openwrt/bin/targets/*/*
+          # 清理不必要的 packages 目录
+          rm -rf packages
+          echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+          echo "status=success" >> $GITHUB_OUTPUT
+        else
+          echo "警告: 固件目录不存在"
+          echo "status=failed" >> $GITHUB_OUTPUT
+        fi
 
     - name: 上传固件目录
       uses: actions/upload-artifact@main
