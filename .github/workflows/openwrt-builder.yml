@@ -107,89 +107,142 @@ jobs:
           cd openwrt
           $GITHUB_WORKSPACE/$DIY_P2_SH
         fi
-# ====================
+
+    # ==================== 下载软件包（修复版）====================
     - name: 下载软件包
       id: package
+      continue-on-error: true
       run: |
         cd openwrt
         
         # 配置
         make defconfig
         
-        # 使用多个镜像源
-        cat >> .config << EOF
-        CONFIG_AUTOREBUILD=y
-        CONFIG_BUILD_SUFFIX=""
-        CONFIG_TARGET_BUILDROOT=y
-        EOF
+        # 创建 swap 防止内存不足
+        sudo fallocate -l 2G /swapfile
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile
+        sudo swapon /swapfile
         
-        # 设置下载工具参数
-        export DOWNLOAD_TIMEOUT=30
-        export DOWNLOAD_RETRIES=5
-        
-        # 下载函数
-        download_packages() {
-          local jobs=$1
-          echo "使用 ${jobs} 线程下载..."
+        # 下载函数（带重试）
+        download_with_retry() {
+          local max_retries=3
+          local attempt=1
           
-          # 使用 timeout 和重试
-          timeout 900 make download -j${jobs} V=sc 2>&1 | while IFS= read -r line; do
-            echo "$line"
-            # 如果5分钟没有输出，显示进度
-            echo "$line" | grep -q "download" && echo ">>> 正在下载: ${line}"
+          while [ $attempt -le $max_retries ]; do
+            echo "下载尝试 $attempt/$max_retries..."
+            
+            # 清理可能的锁文件
+            find . -name "*.lock" -delete 2>/dev/null || true
+            
+            # 先快速下载常用包
+            make download -j4 V=sc || {
+              echo "快速下载失败，尝试完整下载..."
+              make download -j1 V=s
+            }
+            
+            # 检查下载结果
+            DOWNLOADED=$(find dl -type f -name "*.tar.*" 2>/dev/null | wc -l)
+            if [ $DOWNLOADED -gt 10 ]; then
+              echo "成功下载 $DOWNLOADED 个源码包"
+              return 0
+            fi
+            
+            echo "下载不完整，重试..."
+            attempt=$((attempt + 1))
+            sleep 10
           done
           
-          return ${PIPESTATUS[0]}
+          return 1
         }
         
-        # 尝试多线程下载
-        if download_packages 8; then
-          echo "多线程下载成功"
+        # 执行下载
+        if download_with_retry; then
+          echo "download_status=success" >> $GITHUB_OUTPUT
         else
-          echo "多线程下载失败，尝试单线程..."
-          if download_packages 1; then
-            echo "单线程下载成功"
-          else
-            echo "下载仍然失败，但继续编译..."
-          fi
+          echo "部分下载失败，继续编译..."
+          echo "download_status=partial" >> $GITHUB_OUTPUT
         fi
         
-        # 检查下载的文件
-        echo "下载完成，文件统计："
-        find dl -type f -name "*.tar.*" | wc -l
-        
         # 清理无效文件
-        find dl -size -1024c -delete
+        find dl -size -1024c -delete 2>/dev/null || true
         
-        echo "download_status=success" >> $GITHUB_OUTPUT
+        echo "最终下载文件数: $(find dl -type f | wc -l)"
 
-    # ==================== 5. 编译固件 ====================
+    # ==================== 5. 编译固件（分步修复版）====================
     - name: 编译固件
       id: compile
       if: github.event.inputs.test_mode != 'true'
       run: |
         cd openwrt
-        echo "开始编译，使用 $(nproc) 个线程"
         
-        # 设置 ccache 环境变量
+        # 设置环境
         export PATH="/usr/lib/ccache:$PATH"
         export CCACHE_DIR=${{ env.CCACHE_DIR }}
+        export FORCE_UNSAFE_CONFIGURE=1
         
-        # 显示 ccache 统计信息
-        ccache -s
-        
-        # 编译主流程
-        if make -j$(nproc); then
-          echo "编译成功"
-        elif make -j1; then
-          echo "单线程编译成功"
-        else
-          echo "编译失败，输出详细日志"
-          make -j1 V=s
-          exit 1
+        # 确保 swap 存在
+        if [ $(swapon -s | wc -l) -eq 0 ]; then
+          sudo fallocate -l 2G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
         fi
         
-        echo "status=success" >> $GITHUB_OUTPUT
+        echo "========== 系统资源 =========="
+        free -h
+        df -h
+        echo "=============================="
+        
+        # 显示 ccache 统计
+        ccache -s
+        
+        # 步骤1: 编译工具链（单线程，防止卡住）
+        echo "========== 步骤1/4: 编译工具链 =========="
+        if make -j1 toolchain/compile V=sc; then
+          echo "工具链编译成功"
+        else
+          echo "工具链编译失败，尝试继续..."
+        fi
+        
+        # 步骤2: 编译内核
+        echo "========== 步骤2/4: 编译内核 =========="
+        make -j$(nproc) target/linux/compile V=sc || {
+          echo "内核编译失败，尝试单线程..."
+          make -j1 target/linux/compile V=s
+        }
+        
+        # 步骤3: 编译软件包
+        echo "========== 步骤3/4: 编译软件包 =========="
+        make -j$(nproc) package/compile V=sc || {
+          echo "软件包编译失败，尝试单线程..."
+          make -j1 package/compile V=s
+        }
+        
+        # 步骤4: 构建固件
+        echo "========== 步骤4/4: 构建固件 =========="
+        if make -j$(nproc) target/install V=sc; then
+          echo "固件构建成功"
+        else
+          echo "固件构建失败，尝试单线程..."
+          make -j1 V=s
+        fi
+        
+        # 检查结果
+        if [ -d "bin/targets" ] && [ "$(ls -A bin/targets/*/*/*.bin 2>/dev/null)" ]; then
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "编译成功！"
+        else
+          echo "未找到固件文件，编译可能失败"
+          # 最后尝试完整编译
+          echo "尝试完整编译..."
+          make -j1 V=s
+          if [ -d "bin/targets" ] && [ "$(ls -A bin/targets/*/*/*.bin 2>/dev/null)" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            exit 1
+          fi
+        fi
         
         # 提取设备名称
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
@@ -200,7 +253,7 @@ jobs:
         echo "FILE_TIME=$(date "+%m月%d日-%H点%M分")" >> $GITHUB_ENV
         echo "RELEASE_TAG=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_ENV
         
-        # 显示 ccache 统计信息
+        # 显示 ccache 统计
         ccache -s
 
     - name: 检查磁盘使用情况
