@@ -1,10 +1,3 @@
-#
-# 融合版本：基于 P3TERX/Actions-OpenWrt + 增强特性
-# 原作者: P3TERX (https://github.com/P3TERX/Actions-OpenWrt)
-# 增强特性来源: OP-6.1-Plus 项目
-# License: MIT
-#
-
 name: OpenWrt Builder Enhanced
 
 on:
@@ -15,11 +8,8 @@ on:
         description: '测试模式（只下载不编译）'
         required: false
         default: 'false'
-  # schedule:
-  #   - cron: '0 20 */3 * *'  # 每3天编译一次（按需启用）
 
 env:
-  # 源码配置
   REPO_URL: https://github.com/coolsnowwolf/lede
   REPO_BRANCH: master
   FEEDS_CONF: feeds.conf.default
@@ -27,16 +17,14 @@ env:
   DIY_P1_SH: diy-part1.sh
   DIY_P2_SH: diy-part2.sh
   
-  # 编译优化
   CCACHE_DIR: ${{ github.workspace }}/ccache
   CCACHE_MAXSIZE: 5G
   
-  # 上传配置
   UPLOAD_BIN_DIR: false
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
+  UPLOAD_PACKAGES: true   # ✅ 新增
   
-  # 系统配置
   TZ: Asia/Shanghai
 
 jobs:
@@ -45,11 +33,9 @@ jobs:
     if: github.event.repository.owner.id == github.event.sender.id || github.event_name == 'workflow_dispatch'
 
     steps:
-    # ==================== 1. 代码检出 ====================
     - name: 检出代码
       uses: actions/checkout@main
 
-    # ==================== 2. 编译环境准备 ====================
     - name: Initialization environment
       env:
         DEBIAN_FRONTEND: noninteractive
@@ -64,10 +50,8 @@ jobs:
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
 
-    # ==================== 3. 恢复缓存 ====================
     - name: 创建缓存目录
-      run: |
-        mkdir -p ${{ env.CCACHE_DIR }}
+      run: mkdir -p ${{ env.CCACHE_DIR }}
 
     - name: 恢复 ccache 缓存
       uses: actions/cache@v3
@@ -78,12 +62,10 @@ jobs:
           ccache-${{ runner.os }}-${{ github.ref }}-
           ccache-${{ runner.os }}-
 
-    # ==================== 4. 源码下载 ====================
-    - name: 克隆源码（浅克隆加速）
-      run: |
-        git clone --depth=1 $REPO_URL -b $REPO_BRANCH openwrt
+    - name: 克隆源码
+      run: git clone --depth=1 $REPO_URL -b $REPO_BRANCH openwrt
 
-    - name: 加载自定义 feeds 配置
+    - name: 加载 feeds
       run: |
         [ -e $FEEDS_CONF ] && cp $FEEDS_CONF openwrt/feeds.conf.default
         if [ -f $DIY_P1_SH ]; then
@@ -98,7 +80,7 @@ jobs:
     - name: 安装 feeds
       run: cd openwrt && ./scripts/feeds install -a
 
-    - name: 加载自定义配置
+    - name: 加载配置
       run: |
         [ -e files ] && cp -r files openwrt/
         [ -e $CONFIG_FILE ] && cp $CONFIG_FILE openwrt/.config
@@ -108,159 +90,68 @@ jobs:
           $GITHUB_WORKSPACE/$DIY_P2_SH
         fi
 
-    # ==================== 下载软件包（修复版）====================
     - name: 下载软件包
-      id: package
-      continue-on-error: true
       run: |
         cd openwrt
-        
-        # 配置
         make defconfig
-        
-        # 创建 swap 防止内存不足
-        sudo fallocate -l 2G /swapfile
-        sudo chmod 600 /swapfile
-        sudo mkswap /swapfile
-        sudo swapon /swapfile
-        
-        # 下载函数（带重试）
-        download_with_retry() {
-          local max_retries=3
-          local attempt=1
-          
-          while [ $attempt -le $max_retries ]; do
-            echo "下载尝试 $attempt/$max_retries..."
-            
-            # 清理可能的锁文件
-            find . -name "*.lock" -delete 2>/dev/null || true
-            
-            # 先快速下载常用包
-            make download -j4 V=sc || {
-              echo "快速下载失败，尝试完整下载..."
-              make download -j1 V=s
-            }
-            
-            # 检查下载结果
-            DOWNLOADED=$(find dl -type f -name "*.tar.*" 2>/dev/null | wc -l)
-            if [ $DOWNLOADED -gt 10 ]; then
-              echo "成功下载 $DOWNLOADED 个源码包"
-              return 0
-            fi
-            
-            echo "下载不完整，重试..."
-            attempt=$((attempt + 1))
-            sleep 10
-          done
-          
-          return 1
-        }
-        
-        # 执行下载
-        if download_with_retry; then
-          echo "download_status=success" >> $GITHUB_OUTPUT
-        else
-          echo "部分下载失败，继续编译..."
-          echo "download_status=partial" >> $GITHUB_OUTPUT
-        fi
-        
-        # 清理无效文件
-        find dl -size -1024c -delete 2>/dev/null || true
-        
-        echo "最终下载文件数: $(find dl -type f | wc -l)"
+        make download -j8
+        find dl -size -1024c -delete
 
-    # ==================== 5. 编译固件（分步修复版）====================
     - name: 编译固件
       id: compile
       if: github.event.inputs.test_mode != 'true'
       run: |
         cd openwrt
-        
-        # 设置环境
         export PATH="/usr/lib/ccache:$PATH"
         export CCACHE_DIR=${{ env.CCACHE_DIR }}
-        export FORCE_UNSAFE_CONFIGURE=1
         
-        # 确保 swap 存在
-        if [ $(swapon -s | wc -l) -eq 0 ]; then
-          sudo fallocate -l 2G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-        fi
-        
-        echo "========== 系统资源 =========="
-        free -h
-        df -h
-        echo "=============================="
-        
-        # 显示 ccache 统计
-        ccache -s
-        
-        # 步骤1: 编译工具链（单线程，防止卡住）
-        echo "========== 步骤1/4: 编译工具链 =========="
-        if make -j1 toolchain/compile V=sc; then
-          echo "工具链编译成功"
+        if make -j$(nproc); then
+          echo "编译成功"
         else
-          echo "工具链编译失败，尝试继续..."
-        fi
-        
-        # 步骤2: 编译内核
-        echo "========== 步骤2/4: 编译内核 =========="
-        make -j$(nproc) target/linux/compile V=sc || {
-          echo "内核编译失败，尝试单线程..."
-          make -j1 target/linux/compile V=s
-        }
-        
-        # 步骤3: 编译软件包
-        echo "========== 步骤3/4: 编译软件包 =========="
-        make -j$(nproc) package/compile V=sc || {
-          echo "软件包编译失败，尝试单线程..."
-          make -j1 package/compile V=s
-        }
-        
-        # 步骤4: 构建固件
-        echo "========== 步骤4/4: 构建固件 =========="
-        if make -j$(nproc) target/install V=sc; then
-          echo "固件构建成功"
-        else
-          echo "固件构建失败，尝试单线程..."
           make -j1 V=s
         fi
         
-        # 检查结果
-        if [ -d "bin/targets" ] && [ "$(ls -A bin/targets/*/*/*.bin 2>/dev/null)" ]; then
-          echo "status=success" >> $GITHUB_OUTPUT
-          echo "编译成功！"
-        else
-          echo "未找到固件文件，编译可能失败"
-          # 最后尝试完整编译
-          echo "尝试完整编译..."
-          make -j1 V=s
-          if [ -d "bin/targets" ] && [ "$(ls -A bin/targets/*/*/*.bin 2>/dev/null)" ]; then
-            echo "status=success" >> $GITHUB_OUTPUT
-          else
-            exit 1
-          fi
-        fi
+        echo "status=success" >> $GITHUB_OUTPUT
         
-        # 提取设备名称
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
         [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
         
-        # 生成时间戳
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
         echo "FILE_TIME=$(date "+%m月%d日-%H点%M分")" >> $GITHUB_ENV
         echo "RELEASE_TAG=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_ENV
+
+    # ==================== ✅ 新增：收集IPK ====================
+    - name: 收集IPK包
+      id: collect_packages
+      if: env.UPLOAD_PACKAGES == 'true' && steps.compile.outputs.status == 'success'
+      run: |
+        cd openwrt
+        mkdir -p ${{ github.workspace }}/all_packages
         
-        # 显示 ccache 统计
-        ccache -s
+        if [ -d bin ]; then
+          find bin -name "*.ipk" -type f | while read ipk; do
+            if [[ ! "$ipk" =~ "kernel" ]]; then
+              cp "$ipk" ${{ github.workspace }}/all_packages/
+            fi
+          done
+        fi
+        
+        if [ -d "${{ github.workspace }}/all_packages" ]; then
+          PKG_COUNT=$(ls -1 ${{ github.workspace }}/all_packages/*.ipk 2>/dev/null | wc -l)
+          echo "package_count=$PKG_COUNT" >> $GITHUB_OUTPUT
+          echo "packages_dir=${{ github.workspace }}/all_packages" >> $GITHUB_ENV
+        else
+          echo "package_count=0" >> $GITHUB_OUTPUT
+        fi
 
-    - name: 检查磁盘使用情况
-      if: always() && steps.compile.outcome != 'skipped'
-      run: df -hT
+    # ==================== ✅ 新增：上传IPK ====================
+    - name: 上传IPK包
+      uses: actions/upload-artifact@main
+      if: steps.collect_packages.outputs.package_count != '0'
+      with:
+        name: OpenWrt_packages${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.packages_dir }}
 
-    # ==================== 6. 上传文件 ====================
     - name: 上传 bin 目录
       uses: actions/upload-artifact@main
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
@@ -268,50 +159,39 @@ jobs:
         name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: openwrt/bin
 
-    - name: 整理固件文件
+    - name: 整理固件
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && steps.compile.outputs.status == 'success'
       run: |
         cd openwrt/bin/targets/*/*
-        # 清理不必要的 packages 目录
         rm -rf packages
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
 
-    - name: 上传固件目录
+    - name: 上传固件
       uses: actions/upload-artifact@main
       if: steps.organize.outputs.status == 'success'
       with:
         name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
 
-    # ==================== 7. 发布 Release（增强版）====================
-    - name: 生成 Release 说明
+    - name: 生成 Release
       id: tag
       if: env.UPLOAD_RELEASE == 'true' && steps.compile.outputs.status == 'success'
       run: |
         echo "release_tag=${{ env.RELEASE_TAG }}" >> $GITHUB_OUTPUT
         
-        # 生成详细的 Release 说明
         cat > release.txt << EOF
-        ## 📦 固件信息
+        固件编译完成
         
-        - **源码仓库**: ${{ env.REPO_URL }}
-        - **源码分支**: ${{ env.REPO_BRANCH }}
-        - **编译时间**: ${{ env.FILE_TIME }}
-        - **默认IP**: 192.168.1.235
-        - **时区**: ${{ env.TZ }}
-        
-        ## ✅ 编译状态
-        
-        - 状态: 成功 ✅
-        - 线程数: $(nproc)
-        - 缓存: ccache 已启用 (${{ env.CCACHE_MAXSIZE }})
+        编译时间: ${{ env.FILE_TIME }}
+        源码: ${{ env.REPO_URL }}
+        分支: ${{ env.REPO_BRANCH }}
         EOF
         
         echo "status=success" >> $GITHUB_OUTPUT
 
-    - name: 发布到 Release
+    - name: 发布 Release
       uses: softprops/action-gh-release@master
       if: steps.tag.outputs.status == 'success'
       env:
@@ -321,21 +201,3 @@ jobs:
         name: "OpenWrt 固件 ${{ env.FILE_TIME }}"
         body_path: release.txt
         files: ${{ env.FIRMWARE }}/*
-        draft: false
-        prerelease: false
-
-    # ==================== 8. 清理维护 ====================
-    - name: 清理旧的 Workflow 运行记录
-      uses: Mattraks/delete-workflow-runs@main
-      with:
-        retain_days: 30
-        keep_minimum_runs: 5
-
-    - name: 清理旧的 Release 版本
-      uses: dev-drprasad/delete-older-releases@master
-      if: env.UPLOAD_RELEASE == 'true'
-      with:
-        keep_latest: 5
-        delete_tags: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
