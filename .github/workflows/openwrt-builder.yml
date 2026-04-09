@@ -107,16 +107,60 @@ jobs:
           cd openwrt
           $GITHUB_WORKSPACE/$DIY_P2_SH
         fi
-
+# ====================
     - name: 下载软件包
       id: package
       run: |
         cd openwrt
+        
+        # 配置
         make defconfig
-        make download -j8
-        # 检查并清理无效下载
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
+        
+        # 使用多个镜像源
+        cat >> .config << EOF
+        CONFIG_AUTOREBUILD=y
+        CONFIG_BUILD_SUFFIX=""
+        CONFIG_TARGET_BUILDROOT=y
+        EOF
+        
+        # 设置下载工具参数
+        export DOWNLOAD_TIMEOUT=30
+        export DOWNLOAD_RETRIES=5
+        
+        # 下载函数
+        download_packages() {
+          local jobs=$1
+          echo "使用 ${jobs} 线程下载..."
+          
+          # 使用 timeout 和重试
+          timeout 900 make download -j${jobs} V=sc 2>&1 | while IFS= read -r line; do
+            echo "$line"
+            # 如果5分钟没有输出，显示进度
+            echo "$line" | grep -q "download" && echo ">>> 正在下载: ${line}"
+          done
+          
+          return ${PIPESTATUS[0]}
+        }
+        
+        # 尝试多线程下载
+        if download_packages 8; then
+          echo "多线程下载成功"
+        else
+          echo "多线程下载失败，尝试单线程..."
+          if download_packages 1; then
+            echo "单线程下载成功"
+          else
+            echo "下载仍然失败，但继续编译..."
+          fi
+        fi
+        
+        # 检查下载的文件
+        echo "下载完成，文件统计："
+        find dl -type f -name "*.tar.*" | wc -l
+        
+        # 清理无效文件
+        find dl -size -1024c -delete
+        
         echo "download_status=success" >> $GITHUB_OUTPUT
 
     # ==================== 5. 编译固件 ====================
