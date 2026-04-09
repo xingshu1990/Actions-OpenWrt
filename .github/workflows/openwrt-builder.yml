@@ -5,7 +5,7 @@
 # License: MIT
 #
 
-name: OpenWrt Builder Enhanced
+name: OpenWrt Builder 2026-04-09-09-06
 
 on:
   repository_dispatch:
