@@ -5,7 +5,7 @@
 # License: MIT
 #
 
-name: OpenWrt Builder 2026-04-09-09-06
+name: OpenWrt Builder Enhanced
 
 on:
   repository_dispatch:
@@ -64,11 +64,10 @@ jobs:
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
 
-    # ==================== 3. 恢复缓存（修复权限）====================
+    # ==================== 3. 恢复缓存 ====================
     - name: 创建缓存目录
       run: |
         mkdir -p ${{ env.CCACHE_DIR }}
-        mkdir -p ${{ github.workspace }}/dl_cache
 
     - name: 恢复 ccache 缓存
       uses: actions/cache@v3
@@ -78,15 +77,6 @@ jobs:
         restore-keys: |
           ccache-${{ runner.os }}-${{ github.ref }}-
           ccache-${{ runner.os }}-
-
-    - name: 恢复 DL 源码缓存
-      uses: actions/cache@v3
-      with:
-        path: ${{ github.workspace }}/dl_cache
-        key: dl-${{ runner.os }}-${{ hashFiles('**/feeds.conf.default') }}-${{ github.sha }}
-        restore-keys: |
-          dl-${{ runner.os }}-${{ hashFiles('**/feeds.conf.default') }}-
-          dl-${{ runner.os }}-
 
     # ==================== 4. 源码下载 ====================
     - name: 克隆源码（浅克隆加速）
@@ -118,13 +108,6 @@ jobs:
           $GITHUB_WORKSPACE/$DIY_P2_SH
         fi
 
-    - name: 恢复 DL 缓存到 openwrt/dl
-      run: |
-        if [ -d "${{ github.workspace }}/dl_cache" ] && [ "$(ls -A ${{ github.workspace }}/dl_cache)" ]; then
-          cp -r ${{ github.workspace }}/dl_cache/* openwrt/dl/ 2>/dev/null || true
-          echo "已恢复 DL 缓存"
-        fi
-
     - name: 下载软件包
       id: package
       run: |
@@ -135,13 +118,6 @@ jobs:
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
         echo "download_status=success" >> $GITHUB_OUTPUT
-
-    - name: 备份 DL 缓存
-      run: |
-        if [ -d "openwrt/dl" ] && [ "$(ls -A openwrt/dl)" ]; then
-          cp -r openwrt/dl/* ${{ github.workspace }}/dl_cache/ 2>/dev/null || true
-          echo "已备份 DL 缓存"
-        fi
 
     # ==================== 5. 编译固件 ====================
     - name: 编译固件
